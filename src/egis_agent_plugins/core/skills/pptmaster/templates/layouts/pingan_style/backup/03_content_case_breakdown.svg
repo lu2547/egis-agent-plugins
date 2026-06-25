@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+    <!-- 模板: 内容页 - 案例复盘 -->
+
+    <rect width="1280" height="720" fill="#FAFAFA"/>
+    <text x="72" y="86" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" fill="#333333"><tspan font-size="38" font-weight="700">{{PAGE_TITLE}}</tspan></text>
+    <text x="1208" y="84" text-anchor="end" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#787878">{{SECTION_NAME}}</text>
+    <rect x="72" y="112" width="72" height="10" rx="5" fill="#F05A23"/>
+    <line x1="144" y1="117" x2="1208" y2="117" stroke="#BFBFBF" stroke-width="2"/>
+    <rect x="72" y="144" width="1136" height="50" rx="4" fill="#FFF3EC"/>
+    <text x="96" y="176" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700" fill="#333333">{{KEY_MESSAGE}}</text>
+
+    <rect x="72" y="216" width="548" height="182" rx="6" fill="#FFFFFF" stroke="#E4E4E4"/>
+    <rect x="72" y="216" width="548" height="44" rx="6" fill="#FFF3EC"/>
+    <text x="96" y="244" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#333333">背景</text>
+    <text x="96" y="296" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" fill="#333333">{{CASE_BACKGROUND}}</text>
+    <text x="96" y="342" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" fill="#787878">{{CASE_SCOPE}}</text>
+
+    <rect x="660" y="216" width="548" height="182" rx="6" fill="#FFFFFF" stroke="#E4E4E4"/>
+    <rect x="660" y="216" width="548" height="44" rx="6" fill="#FFF3EC"/>
+    <text x="684" y="244" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#333333">发现</text>
+    <text x="684" y="296" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" fill="#333333">{{CASE_FINDING_1}}</text>
+    <text x="684" y="342" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" fill="#787878">{{CASE_FINDING_2}}</text>
+
+    <rect x="72" y="430" width="548" height="200" rx="6" fill="#FFFFFF" stroke="#E4E4E4"/>
+    <rect x="72" y="430" width="548" height="44" rx="6" fill="#FFF3EC"/>
+    <text x="96" y="458" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#333333">动作</text>
+    <circle cx="104" cy="510" r="5" fill="#F8A06F"/>
+    <text x="124" y="516" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" fill="#333333">{{ACTION_1}}</text>
+    <circle cx="104" cy="556" r="5" fill="#F8A06F"/>
+    <text x="124" y="562" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" fill="#333333">{{ACTION_2}}</text>
+    <circle cx="104" cy="602" r="5" fill="#F8A06F"/>
+    <text x="124" y="608" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" fill="#333333">{{ACTION_3}}</text>
+
+    <rect x="660" y="430" width="548" height="200" rx="6" fill="#FFFFFF" stroke="#E4E4E4"/>
+    <rect x="660" y="430" width="548" height="44" rx="6" fill="#FBD3BF"/>
+    <text x="684" y="458" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#333333">结果</text>
+    <text x="684" y="526" font-family="Arial, Microsoft YaHei, sans-serif" font-size="40" font-weight="700" fill="#F05A23">{{RESULT_VALUE}}</text>
+    <text x="684" y="568" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" fill="#333333">{{RESULT_DESC}}</text>
+    <text x="684" y="606" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" fill="#787878">{{RESULT_NOTE}}</text>
+
+    <line x1="72" y1="660" x2="1208" y2="660" stroke="#DEDEDE" stroke-width="1.2"/>
+    <text x="72" y="688" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="12" fill="#787878">数据来源：{{SOURCE}}</text>
+    <text x="1208" y="688" text-anchor="end" font-family="Arial, sans-serif" font-size="14" fill="#787878">{{PAGE_NUM}} / {{TOTAL_PAGES}}</text>
+</svg>

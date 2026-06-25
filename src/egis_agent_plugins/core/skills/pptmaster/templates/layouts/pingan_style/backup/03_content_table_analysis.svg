@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+    <!-- 模板: 内容页 - 表格分析 -->
+
+    <rect width="1280" height="720" fill="#FAFAFA"/>
+
+    <text x="72" y="86" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" fill="#333333">
+        <tspan font-size="38" font-weight="700">{{PAGE_TITLE}}</tspan>
+    </text>
+    <text x="1208" y="84" text-anchor="end" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#787878">{{SECTION_NAME}}</text>
+
+    <rect x="72" y="112" width="72" height="10" rx="5" fill="#F05A23"/>
+    <line x1="144" y1="117" x2="1208" y2="117" stroke="#BFBFBF" stroke-width="2"/>
+
+    <rect x="72" y="144" width="1136" height="50" rx="4" fill="#FFF3EC"/>
+    <text x="96" y="176" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700" fill="#333333">{{KEY_MESSAGE}}</text>
+
+    <rect x="72" y="216" width="1136" height="54" rx="6" fill="#FFFFFF" stroke="#E4E4E4" stroke-width="1.2"/>
+    <text x="96" y="250" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="17" font-weight="700" fill="#333333">{{TABLE_SUMMARY}}</text>
+
+    <rect x="72" y="292" width="1136" height="338" rx="6" fill="#FFFFFF" stroke="#E4E4E4" stroke-width="1.2"/>
+    <rect x="72" y="292" width="1136" height="46" rx="6" fill="#FBD3BF"/>
+    <text x="96" y="322" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" font-weight="700" fill="#333333">{{COL_1}}</text>
+    <text x="306" y="322" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" font-weight="700" fill="#333333">{{COL_2}}</text>
+    <text x="516" y="322" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" font-weight="700" fill="#333333">{{COL_3}}</text>
+    <text x="746" y="322" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" font-weight="700" fill="#333333">{{COL_4}}</text>
+    <text x="986" y="322" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="15" font-weight="700" fill="#333333">{{COL_5}}</text>
+
+    <rect x="72" y="386" width="1136" height="48" fill="#FFFDFC"/>
+    <rect x="72" y="482" width="1136" height="48" fill="#FFFDFC"/>
+    <rect x="72" y="578" width="1136" height="48" fill="#FFFDFC"/>
+    <line x1="72" y1="338" x2="1208" y2="338" stroke="#E8E8E8"/>
+    <line x1="72" y1="386" x2="1208" y2="386" stroke="#E8E8E8"/>
+    <line x1="72" y1="434" x2="1208" y2="434" stroke="#E8E8E8"/>
+    <line x1="72" y1="482" x2="1208" y2="482" stroke="#E8E8E8"/>
+    <line x1="72" y1="530" x2="1208" y2="530" stroke="#E8E8E8"/>
+    <line x1="72" y1="578" x2="1208" y2="578" stroke="#E8E8E8"/>
+    <line x1="282" y1="292" x2="282" y2="630" stroke="#E8E8E8"/>
+    <line x1="492" y1="292" x2="492" y2="630" stroke="#E8E8E8"/>
+    <line x1="722" y1="292" x2="722" y2="630" stroke="#E8E8E8"/>
+    <line x1="962" y1="292" x2="962" y2="630" stroke="#E8E8E8"/>
+
+    <text x="96" y="370" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_1_COL_1}}</text>
+    <text x="306" y="370" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_1_COL_2}}</text>
+    <text x="516" y="370" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_1_COL_3}}</text>
+    <text x="746" y="370" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_1_COL_4}}</text>
+    <text x="986" y="370" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_1_COL_5}}</text>
+
+    <text x="96" y="418" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_2_COL_1}}</text>
+    <text x="306" y="418" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_2_COL_2}}</text>
+    <text x="516" y="418" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_2_COL_3}}</text>
+    <text x="746" y="418" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_2_COL_4}}</text>
+    <text x="986" y="418" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_2_COL_5}}</text>
+
+    <text x="96" y="466" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_3_COL_1}}</text>
+    <text x="306" y="466" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_3_COL_2}}</text>
+    <text x="516" y="466" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_3_COL_3}}</text>
+    <text x="746" y="466" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_3_COL_4}}</text>
+    <text x="986" y="466" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_3_COL_5}}</text>
+
+    <text x="96" y="514" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_4_COL_1}}</text>
+    <text x="306" y="514" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_4_COL_2}}</text>
+    <text x="516" y="514" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_4_COL_3}}</text>
+    <text x="746" y="514" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_4_COL_4}}</text>
+    <text x="986" y="514" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_4_COL_5}}</text>
+
+    <text x="96" y="562" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_5_COL_1}}</text>
+    <text x="306" y="562" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_5_COL_2}}</text>
+    <text x="516" y="562" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_5_COL_3}}</text>
+    <text x="746" y="562" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_5_COL_4}}</text>
+    <text x="986" y="562" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_5_COL_5}}</text>
+
+    <text x="96" y="610" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_6_COL_1}}</text>
+    <text x="306" y="610" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_6_COL_2}}</text>
+    <text x="516" y="610" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_6_COL_3}}</text>
+    <text x="746" y="610" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_6_COL_4}}</text>
+    <text x="986" y="610" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#333333">{{ROW_6_COL_5}}</text>
+
+    <line x1="72" y1="660" x2="1208" y2="660" stroke="#DEDEDE" stroke-width="1.2"/>
+    <text x="72" y="688" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="12" fill="#787878">数据来源：{{SOURCE}}</text>
+    <text x="1208" y="688" text-anchor="end" font-family="Arial, sans-serif" font-size="14" fill="#787878">{{PAGE_NUM}} / {{TOTAL_PAGES}}</text>
+</svg>

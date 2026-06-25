@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+    <!-- 模板: 内容页 - KPI 指标网格 -->
+
+    <rect width="1280" height="720" fill="#FAFAFA"/>
+
+    <text x="72" y="86" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" fill="#333333">
+        <tspan font-size="38" font-weight="700">{{PAGE_TITLE}}</tspan>
+    </text>
+    <text x="1208" y="84" text-anchor="end" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#787878">
+        {{SECTION_NAME}}
+    </text>
+
+    <rect x="72" y="112" width="72" height="10" rx="5" fill="#F05A23"/>
+    <line x1="144" y1="117" x2="1208" y2="117" stroke="#BFBFBF" stroke-width="2"/>
+
+    <rect x="72" y="144" width="1136" height="50" rx="4" fill="#FFF3EC"/>
+    <text x="96" y="176" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700" fill="#333333">
+        {{KEY_MESSAGE}}
+    </text>
+
+    <rect x="72" y="216" width="266" height="152" rx="6" fill="#FFFFFF" stroke="#E4E4E4" stroke-width="1.2"/>
+    <rect x="72" y="216" width="266" height="38" rx="6" fill="#FFF3EC"/>
+    <text x="96" y="242" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" font-weight="700" fill="#333333">{{KPI_1_LABEL}}</text>
+    <text x="96" y="304" font-family="Arial, Microsoft YaHei, sans-serif" font-size="42" font-weight="700" fill="#F05A23">{{KPI_1_VALUE}}</text>
+    <text x="96" y="340" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#787878">{{KPI_1_NOTE}}</text>
+
+    <rect x="362" y="216" width="266" height="152" rx="6" fill="#FFFFFF" stroke="#E4E4E4" stroke-width="1.2"/>
+    <rect x="362" y="216" width="266" height="38" rx="6" fill="#FFF3EC"/>
+    <text x="386" y="242" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" font-weight="700" fill="#333333">{{KPI_2_LABEL}}</text>
+    <text x="386" y="304" font-family="Arial, Microsoft YaHei, sans-serif" font-size="42" font-weight="700" fill="#F47A45">{{KPI_2_VALUE}}</text>
+    <text x="386" y="340" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#787878">{{KPI_2_NOTE}}</text>
+
+    <rect x="652" y="216" width="266" height="152" rx="6" fill="#FFFFFF" stroke="#E4E4E4" stroke-width="1.2"/>
+    <rect x="652" y="216" width="266" height="38" rx="6" fill="#FFF3EC"/>
+    <text x="676" y="242" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" font-weight="700" fill="#333333">{{KPI_3_LABEL}}</text>
+    <text x="676" y="304" font-family="Arial, Microsoft YaHei, sans-serif" font-size="42" font-weight="700" fill="#F47A45">{{KPI_3_VALUE}}</text>
+    <text x="676" y="340" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#787878">{{KPI_3_NOTE}}</text>
+
+    <rect x="942" y="216" width="266" height="152" rx="6" fill="#FFFFFF" stroke="#E4E4E4" stroke-width="1.2"/>
+    <rect x="942" y="216" width="266" height="38" rx="6" fill="#FFF3EC"/>
+    <text x="966" y="242" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" font-weight="700" fill="#333333">{{KPI_4_LABEL}}</text>
+    <text x="966" y="304" font-family="Arial, Microsoft YaHei, sans-serif" font-size="42" font-weight="700" fill="#F47A45">{{KPI_4_VALUE}}</text>
+    <text x="966" y="340" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" fill="#787878">{{KPI_4_NOTE}}</text>
+
+    <rect x="72" y="394" width="1136" height="236" rx="6" fill="#FFFFFF" stroke="#E4E4E4" stroke-width="1.2"/>
+    <text x="96" y="428" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#333333">{{ANALYSIS_TITLE}}</text>
+    <line x1="96" y1="448" x2="1184" y2="448" stroke="#E8E8E8" stroke-width="1"/>
+    <circle cx="108" cy="484" r="5" fill="#F8A06F"/>
+    <text x="128" y="490" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" fill="#333333">{{INSIGHT_1}}</text>
+    <circle cx="108" cy="530" r="5" fill="#F8A06F"/>
+    <text x="128" y="536" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" fill="#333333">{{INSIGHT_2}}</text>
+    <circle cx="108" cy="576" r="5" fill="#F8A06F"/>
+    <text x="128" y="582" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="16" fill="#333333">{{INSIGHT_3}}</text>
+
+    <line x1="72" y1="660" x2="1208" y2="660" stroke="#DEDEDE" stroke-width="1.2"/>
+    <text x="72" y="688" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="12" fill="#787878">数据来源：{{SOURCE}}</text>
+    <text x="1208" y="688" text-anchor="end" font-family="Arial, sans-serif" font-size="14" fill="#787878">{{PAGE_NUM}} / {{TOTAL_PAGES}}</text>
+</svg>

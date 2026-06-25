@@ -1,0 +1,199 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+    <!-- 
+    堆叠柱状图模板
+    用途: 多类别构成对比、占比趋势分析
+    适用场景: 收入构成、成本分解、市场份额变化
+    支持: 5组数据 × 4个类别（可调整）
+    -->
+    
+    <defs>
+        <!-- 阴影 -->
+        <filter id="stackShadow">
+            <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
+            <feOffset dx="0" dy="1"/>
+            <feComponentTransfer>
+                <feFuncA type="linear" slope="0.2"/>
+            </feComponentTransfer>
+            <feMerge>
+                <feMergeNode/>
+                <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+        </filter>
+    </defs>
+    
+    <!-- 背景 -->
+    <rect width="1280" height="720" fill="#FAFAFA"/>
+    
+    <!-- 标题 -->
+    <text x="60" y="70" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+          font-size="32" font-weight="bold" fill="#333333">
+        <tspan>各季度收入构成分析</tspan>
+    </text>
+    
+    <text x="60" y="105" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+          font-size="18" fill="#7F8C8D">
+        <tspan>2024-2025年度 · 单位：百万元</tspan>
+    </text>
+    
+    <!-- 图表区域 -->
+    <g id="chartArea">
+        <!-- Y轴网格线 -->
+        <line x1="140" y1="550" x2="1100" y2="550" stroke="#D8D1CC" stroke-width="1" stroke-dasharray="4,4"/>
+        <line x1="140" y1="470" x2="1100" y2="470" stroke="#D8D1CC" stroke-width="1" stroke-dasharray="4,4"/>
+        <line x1="140" y1="390" x2="1100" y2="390" stroke="#D8D1CC" stroke-width="1" stroke-dasharray="4,4"/>
+        <line x1="140" y1="310" x2="1100" y2="310" stroke="#D8D1CC" stroke-width="1" stroke-dasharray="4,4"/>
+        <line x1="140" y1="230" x2="1100" y2="230" stroke="#D8D1CC" stroke-width="1" stroke-dasharray="4,4"/>
+        <line x1="140" y1="150" x2="1100" y2="150" stroke="#D8D1CC" stroke-width="1" stroke-dasharray="4,4"/>
+        
+        <!-- Y轴刻度标签 -->
+        <text x="125" y="555" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D" text-anchor="end">
+            <tspan>0</tspan>
+        </text>
+        <text x="125" y="475" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D" text-anchor="end">
+            <tspan>100</tspan>
+        </text>
+        <text x="125" y="395" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D" text-anchor="end">
+            <tspan>200</tspan>
+        </text>
+        <text x="125" y="315" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D" text-anchor="end">
+            <tspan>300</tspan>
+        </text>
+        <text x="125" y="235" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D" text-anchor="end">
+            <tspan>400</tspan>
+        </text>
+        <text x="125" y="155" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D" text-anchor="end">
+            <tspan>500</tspan>
+        </text>
+        
+        <!-- X轴和Y轴 -->
+        <line x1="140" y1="150" x2="140" y2="550" stroke="#8E8E8E" stroke-width="2"/>
+        <line x1="140" y1="550" x2="1100" y2="550" stroke="#8E8E8E" stroke-width="2"/>
+        
+        <!-- 堆叠柱子 - Q1 2024 (总高320, 按比例: 产品A 120, 产品B 100, 产品C 60, 产品D 40) -->
+        <g filter="url(#stackShadow)">
+            <rect x="200" y="422" width="80" height="128" fill="#C0392B"/>
+            <rect x="200" y="342" width="80" height="80" fill="#C85E3D"/>
+            <rect x="200" y="294" width="80" height="48" fill="#E07B23"/>
+            <rect x="200" y="262" width="80" height="32" fill="#A64B38"/>
+        </g>
+        <text x="240" y="580" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#787878" text-anchor="middle">
+            <tspan>Q1'24</tspan>
+        </text>
+        <text x="240" y="247" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" font-weight="600" fill="#333333" text-anchor="middle">
+            <tspan>320</tspan>
+        </text>
+        
+        <!-- 堆叠柱子 - Q2 2024 (总高360) -->
+        <g filter="url(#stackShadow)">
+            <rect x="380" y="406" width="80" height="144" fill="#C0392B"/>
+            <rect x="380" y="318" width="80" height="88" fill="#C85E3D"/>
+            <rect x="380" y="262" width="80" height="56" fill="#E07B23"/>
+            <rect x="380" y="222" width="80" height="40" fill="#A64B38"/>
+        </g>
+        <text x="420" y="580" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#787878" text-anchor="middle">
+            <tspan>Q2'24</tspan>
+        </text>
+        <text x="420" y="207" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" font-weight="600" fill="#333333" text-anchor="middle">
+            <tspan>360</tspan>
+        </text>
+        
+        <!-- 堆叠柱子 - Q3 2024 (总高400) -->
+        <g filter="url(#stackShadow)">
+            <rect x="560" y="390" width="80" height="160" fill="#C0392B"/>
+            <rect x="560" y="294" width="80" height="96" fill="#C85E3D"/>
+            <rect x="560" y="230" width="80" height="64" fill="#E07B23"/>
+            <rect x="560" y="182" width="80" height="48" fill="#A64B38"/>
+        </g>
+        <text x="600" y="580" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#787878" text-anchor="middle">
+            <tspan>Q3'24</tspan>
+        </text>
+        <text x="600" y="167" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" font-weight="600" fill="#333333" text-anchor="middle">
+            <tspan>400</tspan>
+        </text>
+        
+        <!-- 堆叠柱子 - Q4 2024 (总高420) -->
+        <g filter="url(#stackShadow)">
+            <rect x="740" y="382" width="80" height="168" fill="#C0392B"/>
+            <rect x="740" y="278" width="80" height="104" fill="#C85E3D"/>
+            <rect x="740" y="206" width="80" height="72" fill="#E07B23"/>
+            <rect x="740" y="158" width="80" height="48" fill="#A64B38"/>
+        </g>
+        <text x="780" y="580" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#787878" text-anchor="middle">
+            <tspan>Q4'24</tspan>
+        </text>
+        <text x="780" y="143" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" font-weight="600" fill="#333333" text-anchor="middle">
+            <tspan>420</tspan>
+        </text>
+        
+        <!-- 堆叠柱子 - Q1 2025 (总高480) -->
+        <g filter="url(#stackShadow)">
+            <rect x="920" y="358" width="80" height="192" fill="#C0392B"/>
+            <rect x="920" y="246" width="80" height="112" fill="#C85E3D"/>
+            <rect x="920" y="166" width="80" height="80" fill="#E07B23"/>
+            <rect x="920" y="110" width="80" height="56" fill="#A64B38"/>
+        </g>
+        <text x="960" y="580" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#787878" text-anchor="middle">
+            <tspan>Q1'25</tspan>
+        </text>
+        <text x="960" y="95" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" font-weight="600" fill="#333333" text-anchor="middle">
+            <tspan>480</tspan>
+        </text>
+    </g>
+    
+    <!-- 图例 -->
+    <g id="legend" transform="translate(1120, 200)">
+        <rect x="0" y="0" width="140" height="180" rx="8" fill="#F6E9E3" stroke="#D8D1CC" stroke-width="1"/>
+        
+        <text x="70" y="30" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" font-weight="600" fill="#333333" text-anchor="middle">
+            <tspan>收入类别</tspan>
+        </text>
+        
+        <rect x="15" y="50" width="20" height="16" rx="2" fill="#C0392B"/>
+        <text x="45" y="63" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="13" fill="#787878">
+            <tspan>产品销售</tspan>
+        </text>
+        
+        <rect x="15" y="80" width="20" height="16" rx="2" fill="#C85E3D"/>
+        <text x="45" y="93" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="13" fill="#787878">
+            <tspan>服务收入</tspan>
+        </text>
+        
+        <rect x="15" y="110" width="20" height="16" rx="2" fill="#E07B23"/>
+        <text x="45" y="123" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="13" fill="#787878">
+            <tspan>订阅收入</tspan>
+        </text>
+        
+        <rect x="15" y="140" width="20" height="16" rx="2" fill="#A64B38"/>
+        <text x="45" y="153" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="13" fill="#787878">
+            <tspan>其他收入</tspan>
+        </text>
+    </g>
+    
+    <!-- 数据来源 -->
+    <text x="60" y="695" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+          font-size="14" fill="#8E8E8E">
+        <tspan>数据来源: 财务部门报表</tspan>
+    </text>
+</svg>
+

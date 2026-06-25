@@ -1,0 +1,214 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+    <!-- 
+    Bullet Chart Template
+    Purpose: Target vs Actual comparison, more space-efficient than gauges
+    Use cases: KPI achievement, sales targets, budget execution, performance evaluation
+    Supports: 5 metrics displayed in parallel
+    -->
+    
+    <defs>
+        <linearGradient id="bulletExcellent" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" style="stop-color:#F8EEE8;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#F8EEE8;stop-opacity:1" />
+        </linearGradient>
+        
+        <linearGradient id="bulletGood" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" style="stop-color:#F8EEE8;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#F0D1BC;stop-opacity:1" />
+        </linearGradient>
+        
+        <linearGradient id="bulletFair" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" style="stop-color:#F8EEE8;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#F0D1BC;stop-opacity:1" />
+        </linearGradient>
+        
+        <linearGradient id="actualBar" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" style="stop-color:#A93226;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#C0392B;stop-opacity:1" />
+        </linearGradient>
+        
+        <linearGradient id="actualBarGreen" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" style="stop-color:#A64B38;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#C85E3D;stop-opacity:1" />
+        </linearGradient>
+        
+        <linearGradient id="actualBarOrange" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" style="stop-color:#C85E3D;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#E07B23;stop-opacity:1" />
+        </linearGradient>
+    </defs>
+    
+    <rect width="1280" height="720" fill="#FAFAFA"/>
+    
+    <text x="640" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+          font-size="32" font-weight="bold" fill="#333333" text-anchor="middle">
+        <tspan>2025 Annual KPI Achievement Status</tspan>
+    </text>
+    
+    <text x="640" y="85" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+          font-size="18" fill="#7F8C8D" text-anchor="middle">
+        <tspan>Target vs Actual - As of Q4</tspan>
+    </text>
+    
+    <!-- Legend -->
+    <g id="legend" transform="translate(900, 100)">
+        <rect x="0" y="0" width="20" height="12" fill="#F0D1BC" rx="2"/>
+        <text x="28" y="10" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="12" fill="#787878"><tspan>Fair (0-60%)</tspan></text>
+        
+        <rect x="120" y="0" width="20" height="12" fill="#F0D1BC" rx="2"/>
+        <text x="148" y="10" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="12" fill="#787878"><tspan>Good (60-80%)</tspan></text>
+        
+        <rect x="250" y="0" width="20" height="12" fill="#F8EEE8" rx="2"/>
+        <text x="278" y="10" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="12" fill="#787878"><tspan>Excellent (80-100%+)</tspan></text>
+    </g>
+    
+    <!-- Bullet 1: Sales Revenue 92% -->
+    <g id="bullet1" transform="translate(80, 140)">
+        <text x="0" y="35" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="18" font-weight="600" fill="#333333">
+            <tspan>Sales Revenue</tspan>
+        </text>
+        <text x="0" y="55" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D">
+            <tspan>Target: $100M</tspan>
+        </text>
+        
+        <rect x="180" y="20" width="900" height="50" fill="url(#bulletFair)" rx="4"/>
+        <rect x="180" y="20" width="720" height="50" fill="url(#bulletGood)" rx="4"/>
+        <rect x="180" y="20" width="540" height="50" fill="url(#bulletExcellent)" rx="4"/>
+        <rect x="180" y="32" width="828" height="26" fill="url(#actualBarGreen)" rx="3"/>
+        <line x1="1080" y1="15" x2="1080" y2="75" stroke="#C0392B" stroke-width="4"/>
+        <text x="1020" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="16" font-weight="bold" fill="#FFFFFF">
+            <tspan>$92M</tspan>
+        </text>
+        <text x="1120" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="20" font-weight="bold" fill="#C85E3D">
+            <tspan>92%</tspan>
+        </text>
+    </g>
+    
+    <!-- Bullet 2: New Customers 97% -->
+    <g id="bullet2" transform="translate(80, 240)">
+        <text x="0" y="35" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="18" font-weight="600" fill="#333333">
+            <tspan>New Customers</tspan>
+        </text>
+        <text x="0" y="55" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D">
+            <tspan>Target: 500</tspan>
+        </text>
+        
+        <rect x="180" y="20" width="900" height="50" fill="url(#bulletFair)" rx="4"/>
+        <rect x="180" y="20" width="720" height="50" fill="url(#bulletGood)" rx="4"/>
+        <rect x="180" y="20" width="540" height="50" fill="url(#bulletExcellent)" rx="4"/>
+        <rect x="180" y="32" width="873" height="26" fill="url(#actualBarGreen)" rx="3"/>
+        <line x1="1080" y1="15" x2="1080" y2="75" stroke="#C0392B" stroke-width="4"/>
+        <text x="1050" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="16" font-weight="bold" fill="#FFFFFF">
+            <tspan>485</tspan>
+        </text>
+        <text x="1120" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="20" font-weight="bold" fill="#C85E3D">
+            <tspan>97%</tspan>
+        </text>
+    </g>
+    
+    <!-- Bullet 3: Customer Satisfaction 98% -->
+    <g id="bullet3" transform="translate(80, 340)">
+        <text x="0" y="35" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="18" font-weight="600" fill="#333333">
+            <tspan>Customer Satisfaction</tspan>
+        </text>
+        <text x="0" y="55" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D">
+            <tspan>Target: 90%</tspan>
+        </text>
+        
+        <rect x="180" y="20" width="900" height="50" fill="url(#bulletFair)" rx="4"/>
+        <rect x="180" y="20" width="720" height="50" fill="url(#bulletGood)" rx="4"/>
+        <rect x="180" y="20" width="540" height="50" fill="url(#bulletExcellent)" rx="4"/>
+        <rect x="180" y="32" width="880" height="26" fill="url(#actualBarGreen)" rx="3"/>
+        <line x1="990" y1="15" x2="990" y2="75" stroke="#C0392B" stroke-width="4"/>
+        <text x="1050" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="16" font-weight="bold" fill="#FFFFFF">
+            <tspan>88%</tspan>
+        </text>
+        <text x="1120" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="20" font-weight="bold" fill="#C85E3D">
+            <tspan>98%</tspan>
+        </text>
+    </g>
+    
+    <!-- Bullet 4: Market Share 72% -->
+    <g id="bullet4" transform="translate(80, 440)">
+        <text x="0" y="35" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="18" font-weight="600" fill="#333333">
+            <tspan>Market Share</tspan>
+        </text>
+        <text x="0" y="55" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D">
+            <tspan>Target: 25%</tspan>
+        </text>
+        
+        <rect x="180" y="20" width="900" height="50" fill="url(#bulletFair)" rx="4"/>
+        <rect x="180" y="20" width="720" height="50" fill="url(#bulletGood)" rx="4"/>
+        <rect x="180" y="20" width="540" height="50" fill="url(#bulletExcellent)" rx="4"/>
+        <rect x="180" y="32" width="648" height="26" fill="url(#actualBarOrange)" rx="3"/>
+        <line x1="1080" y1="15" x2="1080" y2="75" stroke="#C0392B" stroke-width="4"/>
+        <text x="815" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="16" font-weight="bold" fill="#FFFFFF">
+            <tspan>18%</tspan>
+        </text>
+        <text x="1120" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="20" font-weight="bold" fill="#E07B23">
+            <tspan>72%</tspan>
+        </text>
+    </g>
+    
+    <!-- Bullet 5: Cost Control 119% (Over budget) -->
+    <g id="bullet5" transform="translate(80, 540)">
+        <text x="0" y="35" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="18" font-weight="600" fill="#333333">
+            <tspan>Cost Control</tspan>
+        </text>
+        <text x="0" y="55" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D">
+            <tspan>Budget: $80M</tspan>
+        </text>
+        
+        <rect x="180" y="20" width="900" height="50" fill="url(#bulletExcellent)" rx="4"/>
+        <rect x="720" y="20" width="360" height="50" fill="url(#bulletGood)" rx="4"/>
+        <rect x="900" y="20" width="180" height="50" fill="url(#bulletFair)" rx="4"/>
+        <rect x="180" y="32" width="855" height="26" fill="#C0392B" rx="3"/>
+        <line x1="720" y1="15" x2="720" y2="75" stroke="#C85E3D" stroke-width="4"/>
+        <text x="1020" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="16" font-weight="bold" fill="#FFFFFF">
+            <tspan>$95M</tspan>
+        </text>
+        <text x="1120" y="50" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="20" font-weight="bold" fill="#C0392B">
+            <tspan>119%</tspan>
+        </text>
+    </g>
+    
+    <!-- Insight box -->
+    <g id="insight">
+        <rect x="80" y="630" width="1120" height="60" rx="6" fill="#F8EEE8" stroke="#C0392B" stroke-width="2"/>
+        <text x="100" y="655" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="16" font-weight="600" fill="#333333">
+            <tspan>Summary:</tspan>
+        </text>
+        <text x="200" y="655" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="15" fill="#787878">
+            <tspan>3 KPIs exceeded targets. Market share growth needs strengthening. Cost control requires attention.</tspan>
+        </text>
+        <text x="100" y="678" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" 
+              font-size="14" fill="#7F8C8D">
+            <tspan>Recommendation: Prioritize cutting non-core project expenses while increasing marketing budget.</tspan>
+        </text>
+    </g>
+</svg>

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+    <!-- 模板: 内容页 - Ping An Style（自由内容画布） -->
+
+    <rect width="1280" height="720" fill="#FAFAFA"/>
+
+    <!-- KEY_MESSAGE 放在正文画布上方，仅用极淡橘色底承托 -->
+    <text x="72" y="86" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" fill="#333333">
+        <tspan font-size="38" font-weight="700">{{PAGE_TITLE}}</tspan>
+    </text>
+    <text x="1208" y="84" text-anchor="end" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#787878">
+        {{SECTION_NAME}}
+    </text>
+
+    <rect x="72" y="112" width="72" height="10" rx="5" fill="#F05A23"/>
+    <line x1="144" y1="117" x2="1208" y2="117" stroke="#BFBFBF" stroke-width="2"/>
+
+    <rect x="72" y="144" width="1136" height="50" rx="4" fill="#FFF3EC"/>
+    <text x="96" y="176" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="20" font-weight="700" fill="#333333">
+        {{KEY_MESSAGE}}
+    </text>
+
+    <rect x="72" y="216" width="1136" height="414" rx="4" fill="#FFFFFF" stroke="#DCDCDC" stroke-width="1.4" stroke-dasharray="8 8"/>
+    <text x="640" y="432" text-anchor="middle" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="26" font-weight="700" fill="#C8C8C8">
+        {{CONTENT_AREA}}
+    </text>
+
+    <line x1="72" y1="660" x2="1208" y2="660" stroke="#DEDEDE" stroke-width="1.2"/>
+    <text x="72" y="688" font-family="Microsoft YaHei, PingFang SC, Arial, sans-serif" font-size="12" fill="#787878">
+        数据来源：{{SOURCE}}
+    </text>
+    <text x="1208" y="688" text-anchor="end" font-family="Arial, sans-serif" font-size="14" fill="#787878">
+        {{PAGE_NUM}} / {{TOTAL_PAGES}}
+    </text>
+</svg>
