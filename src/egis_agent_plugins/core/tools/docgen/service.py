@@ -33,6 +33,123 @@ from egis_agent_plugins.core.tools.docgen._project_model import (
 logger = logging.getLogger(__name__)
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Deep-merge two JSON-like dicts without mutating either input."""
+    merged = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def default_docgen_state() -> dict[str, Any]:
+    """Shared DocGen session blackboard.
+
+    This state lives in ark session.state only. Project files remain artifacts
+    and audit logs; they are not the runtime source of truth.
+    """
+    return {
+        "schema_version": 1,
+        "project_id": "",
+        "project_path": "",
+        "status": "active",
+        "mode": None,
+        "template_id": None,
+        "active_flow": None,
+        "stage": "entry",
+        "awaiting": None,
+        "input": {
+            "original_request": "",
+            "last_user_message": "",
+            "normalized_event": None,
+        },
+        "selection": {
+            "mode": None,
+            "template_id": None,
+            "version": None,
+            "format": "word",
+        },
+        "artifacts": {
+            "source_files": [],
+            "parsed_markdown": None,
+            "template_json": None,
+            "filled_json": None,
+            "draft_docx": None,
+            "final_docx": None,
+            "docx": {},
+            "rag_packs": {},
+        },
+        "flows": {},
+        "ui": {
+            "blocking": False,
+            "component": None,
+            "payload": None,
+        },
+        "cache": {},
+    }
+
+
+def get_docgen_state(context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read DocGen state from ark session context.
+
+    Supports both the new nested ``docgen_state`` shape and existing dotted
+    compatibility keys such as ``docgen_state.project_path``.
+    """
+    ctx = context or {}
+    state = merge_dict(default_docgen_state(), _as_dict(ctx.get("docgen_state")))
+
+    for flat_key, value in ctx.items():
+        if not isinstance(flat_key, str) or not flat_key.startswith("docgen_state."):
+            continue
+        parts = flat_key.split(".")[1:]
+        cursor = state
+        for part in parts[:-1]:
+            next_value = cursor.get(part)
+            if not isinstance(next_value, dict):
+                next_value = {}
+                cursor[part] = next_value
+            cursor = next_value
+        if parts:
+            cursor[parts[-1]] = value
+    return state
+
+
+def patch_docgen_state(
+    context: dict[str, Any] | None,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the next DocGen session state after applying ``patch``."""
+    return merge_dict(get_docgen_state(context), patch)
+
+
+def docgen_state_delta(state: dict[str, Any]) -> dict[str, Any]:
+    """Build state_delta for ark session merging.
+
+    The nested state is canonical. Legacy dotted keys are emitted for existing
+    flows still reading via ``get_state_value``.
+    """
+    delta: dict[str, Any] = {"docgen_state": state}
+    for key in (
+        "project_id",
+        "project_path",
+        "mode",
+        "template_id",
+        "active_flow",
+        "stage",
+        "awaiting",
+        "status",
+    ):
+        if key in state:
+            delta[f"docgen_state.{key}"] = state.get(key)
+    return delta
+
+
 def get_state_value(context: dict[str, Any], dotted_key: str, default: Any = "") -> Any:
     """Read state from either flattened keys or nested runtime state.
 

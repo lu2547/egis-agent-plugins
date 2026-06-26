@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -40,6 +41,45 @@ def _diag(msg: str) -> None:
 
 PLANNING_TOOL_NAME = "todo_write"
 TERMINAL_TOOL_NAME = "final_answer"
+
+
+def _tool_arg(tool_call: ToolCall, key: str) -> Any:
+    args = getattr(tool_call, "arguments", None)
+    if isinstance(args, dict):
+        if key in args:
+            return args.get(key)
+        raw = args.get("args")
+        if isinstance(raw, dict):
+            return raw.get(key)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed.get(key)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _is_long_docgen_tool(tool_call: ToolCall) -> bool:
+    """Tools that must finish before final_answer is allowed to stop the loop."""
+    if tool_call.name != "docgen_pension_intro_flow":
+        return False
+    action = str(_tool_arg(tool_call, "action") or "").strip()
+    return action == "generate"
+
+
+def _drop_terminal_when_long_tool_pending(tool_calls: list[ToolCall]) -> list[ToolCall]:
+    if not any(_is_long_docgen_tool(tc) for tc in tool_calls):
+        return tool_calls
+    if not any(tc.name == TERMINAL_TOOL_NAME for tc in tool_calls):
+        return tool_calls
+    filtered = [tc for tc in tool_calls if tc.name != TERMINAL_TOOL_NAME]
+    _diag(
+        "[planning_guard] drop final_answer from same batch as long docgen tool "
+        f"(original={[tc.name for tc in tool_calls]}, kept={[tc.name for tc in filtered]})"
+    )
+    return filtered
 
 # ── 默认引导计划模板（通用，无领域假设） ────────────────────────
 
@@ -119,6 +159,8 @@ def build_planning_callbacks(
         """
         state = ctx.session.state or {}
         tool_calls = response.tool_calls or []
+        tool_calls = _drop_terminal_when_long_tool_pending(tool_calls)
+        response.tool_calls = tool_calls
         tool_names = [tc.name for tc in tool_calls]
         has_planning_state = bool(state.get("user:planning_state"))
         state_keys = sorted(state.keys()) if isinstance(state, dict) else []

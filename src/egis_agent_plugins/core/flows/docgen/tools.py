@@ -34,12 +34,14 @@ class DocgenEntryTool(WorkflowTool):
         "actions:\n"
         "  start - 创建流程实例\n"
         "  show_entry - 展示入口卡片（BLOCKING）\n"
+        "  select_mode - 选择制作方式 (args: mode=standard|ai)\n"
+        "  select_template - 选择模板 (args: template_id=pension_intro|investment_report|tender|ai_word|ai_ppt)\n"
         "  select_tender - 选择标书 [word]（标化）\n"
         "  select_pension_intro - 选择平安养老险优势介绍 [word]（标化）\n"
         "  select_investment_report - 选择投资报告 [word]（标化）\n"
         "  select_word - 选择 AI Word 制作\n"
         "  select_ppt - 选择 AI PPT 制作\n"
-        "show_entry 会基于项目状态 JSON 判断展示制作方式选择，还是直接展示标化模板列表。\n"
+        "所有 action 会更新 ark session.state.docgen_state；show_entry 基于 session docgen_state 展示制作方式或模板列表。\n"
         "show_entry 后必须 final_answer(is_blocking=true)。"
     )
     flow_cls: ClassVar[type] = DocgenEntryFlow

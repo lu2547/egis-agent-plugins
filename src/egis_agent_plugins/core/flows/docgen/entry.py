@@ -21,16 +21,43 @@ from typing import Any, ClassVar
 
 from ark_agentic.core.workflow.engine import Workflow
 from ark_agentic.core.workflow.protocol import (
-    EffectOutput, InstanceCtx, Transition,
+    ANY_STATE, KEEP_STATE, EffectOutput, InstanceCtx, Transition,
 )
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-_ENTRY_STATE_FILE = "docgen_entry_state.json"
+
+class SelectModeArgs(BaseModel):
+    mode: str = Field(description="制作方式: standard(标化材料制作) / ai(AI 制作)")
 
 
-def _state_event(action: str, **data: Any) -> dict[str, Any]:
-    return {"action": action, **data}
+class SelectTemplateArgs(BaseModel):
+    template_id: str = Field(
+        description="模板 ID，如 pension_intro / investment_report / tender / ai_word / ai_ppt",
+    )
+
+
+_TEMPLATE_DOC_TYPE: dict[str, str] = {
+    "tender": "tender_word",
+    "pension": "pension_intro_word",
+    "pension_intro": "pension_intro_word",
+    "investment": "investment_report_word",
+    "investment_report": "investment_report_word",
+    "word": "ai_word",
+    "ai_word": "ai_word",
+    "ppt": "ai_ppt",
+    "ai_ppt": "ai_ppt",
+}
+
+
+_DOC_TYPE_TEMPLATE: dict[str, str] = {
+    "tender_word": "tender",
+    "pension_intro_word": "pension_intro",
+    "investment_report_word": "investment_report",
+    "ai_word": "ai_word",
+    "ai_ppt": "ai_ppt",
+}
 
 
 def _get_user_request(ictx: InstanceCtx) -> str:
@@ -59,73 +86,32 @@ def _infer_mode_from_request(user_request: str) -> str | None:
     return None
 
 
-def _initial_entry_state(
-    *,
-    project_id: str,
-    project_path: str,
-    user_request: str,
+def _doc_type_from_template(template_id: str) -> str:
+    return _TEMPLATE_DOC_TYPE.get(template_id.strip(), "")
+
+
+def _entry_state_delta(
+    ictx: InstanceCtx,
+    patch: dict[str, Any],
 ) -> dict[str, Any]:
-    mode = _infer_mode_from_request(user_request)
-    return {
-        "schema_version": 1,
-        "workflow": "docgen_entry",
-        "project_id": project_id,
-        "project_path": project_path,
-        "user_request": user_request,
-        "mode": mode,
-        "doc_type": None,
-        "selected_template": None,
-        "current_step": "template_selection" if mode else "mode_selection",
-        "next_action": "select_template" if mode == "standard" else "select_mode",
-        "status": "started",
-        "history": [_state_event("start", mode=mode, user_request=user_request)],
-    }
-
-
-def _load_entry_state(project_path: str) -> dict[str, Any]:
-    if not project_path:
-        return {}
-    path = Path(project_path) / "templates" / _ENTRY_STATE_FILE
-    if not path.exists():
-        return {}
-    try:
-        import json
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[DocgenEntry] failed to load entry state: %s", exc)
-        return {}
-
-
-def _save_entry_state(project_path: str, state: dict[str, Any]) -> None:
     from egis_agent_plugins.core.tools.docgen import service
 
-    service.save_json_artifact(
-        data=state,
-        filename=_ENTRY_STATE_FILE,
-        project_path=Path(project_path),
-        subdir="templates",
-    )
-
-
-def _append_history(state: dict[str, Any], action: str, **data: Any) -> None:
-    history = state.setdefault("history", [])
-    if isinstance(history, list):
-        history.append(_state_event(action, **data))
-        del history[:-20]
+    next_state = service.patch_docgen_state(ictx.session_ctx, patch)
+    return service.docgen_state_delta(next_state)
 
 
 # ── Effects ──────────────────────────────────────────────────────────
 
 
 async def _ef_start(ictx: InstanceCtx) -> EffectOutput | None:
-    """创建入口 flow 实例，初始化路由项目和过程状态 JSON。"""
+    """创建或恢复入口 flow 实例，运行态只写 ark session state。"""
     from egis_agent_plugins.core.tools.docgen import service
 
     user_request = _get_user_request(ictx)
-    project_id = service.get_state_value(ictx.session_ctx, "docgen_state.project_id", "")
-    project_path = service.get_state_value(ictx.session_ctx, "docgen_state.project_path", "")
+    docgen_state = service.get_docgen_state(ictx.session_ctx)
+    project_id = str(docgen_state.get("project_id") or "")
+    project_path = str(docgen_state.get("project_path") or "")
+    mode = str(docgen_state.get("mode") or "") or _infer_mode_from_request(user_request)
 
     store = service.ProjectStore()
     manifest = store.get_project(Path(project_path)) if project_path else None
@@ -142,64 +128,187 @@ async def _ef_start(ictx: InstanceCtx) -> EffectOutput | None:
     elif not project_id:
         project_id = manifest.project_id
 
-    state = _load_entry_state(project_path)
-    if not state:
-        state = _initial_entry_state(
-            project_id=project_id,
-            project_path=project_path,
-            user_request=user_request,
-        )
-    else:
-        if user_request:
-            state["user_request"] = user_request
-            inferred_mode = _infer_mode_from_request(user_request)
-            if inferred_mode:
-                state["mode"] = inferred_mode
-                state["current_step"] = "template_selection"
-                state["next_action"] = "select_template"
-            _append_history(state, "start", mode=state.get("mode"), user_request=user_request)
+    stage = "template_selection" if mode == "standard" else "mode_selection"
+    awaiting = "template" if mode == "standard" else "mode"
 
-    _save_entry_state(project_path, state)
-
-    ictx.instance_data["step"] = state.get("current_step")
-    ictx.instance_data["mode"] = state.get("mode")
-    ictx.instance_data["doc_type"] = state.get("doc_type")
+    ictx.instance_data["step"] = stage
+    ictx.instance_data["mode"] = mode or None
+    ictx.instance_data["doc_type"] = docgen_state.get("doc_type")
     ictx.instance_data["project_id"] = project_id
     ictx.instance_data["project_path"] = project_path
+
+    state_delta = _entry_state_delta(
+        ictx,
+        {
+            "project_id": project_id,
+            "project_path": project_path,
+            "status": "active",
+            "mode": mode or None,
+            "stage": stage,
+            "awaiting": awaiting,
+            "input": {
+                "original_request": docgen_state.get("input", {}).get("original_request") or user_request,
+                "last_user_message": user_request,
+            },
+            "selection": {"mode": mode or None},
+            "flows": {
+                "entry": {
+                    "stage": stage,
+                    "awaiting": awaiting,
+                },
+            },
+        },
+    )
 
     return EffectOutput(
         message="DocGen 入口流程已启动。",
         extras={
-            "docgen_state.project_id": project_id,
-            "docgen_state.project_path": project_path,
-            "docgen_state.entry_state_path": f"templates/{_ENTRY_STATE_FILE}",
-            "docgen_state.entry_mode": state.get("mode"),
-            "docgen_state.entry_step": state.get("current_step"),
+            **state_delta,
+            "docgen_state.entry_mode": mode or None,
+            "docgen_state.entry_step": stage,
         },
     )
 
 
 async def _ef_show_entry(ictx: InstanceCtx) -> EffectOutput | None:
     """准备展示入口卡片（frontend_digest 由 DocgenEntryTool 发送）。"""
-    project_path = str(ictx.instance_data.get("project_path") or "")
-    state = _load_entry_state(project_path)
-    mode = state.get("mode") or ictx.args.get("mode") or ictx.args.get("initial_mode")
+    from egis_agent_plugins.core.tools.docgen import service
+
+    docgen_state = service.get_docgen_state(ictx.session_ctx)
+    mode = (
+        ictx.args.get("mode")
+        or ictx.args.get("initial_mode")
+        or ictx.instance_data.get("mode")
+        or docgen_state.get("mode")
+    )
     if mode in ("standard", "ai"):
-        state["mode"] = mode
-        state["current_step"] = "template_selection"
-        state["next_action"] = "select_template"
-        _append_history(state, "show_entry", mode=mode)
-        if project_path:
-            _save_entry_state(project_path, state)
+        stage = "template_selection"
+        awaiting = "template"
+    else:
+        mode = None
+        stage = "mode_selection"
+        awaiting = "mode"
+
     ictx.instance_data["step"] = "entry"
     ictx.instance_data["mode"] = mode
+    state_delta = _entry_state_delta(
+        ictx,
+        {
+            "mode": mode,
+            "stage": stage,
+            "awaiting": awaiting,
+            "selection": {"mode": mode},
+            "flows": {
+                "entry": {
+                    "stage": stage,
+                    "awaiting": awaiting,
+                },
+            },
+            "ui": {
+                "blocking": True,
+                "component": "docgen_entry",
+                "payload": {"initial_mode": mode} if mode else {},
+            },
+        },
+    )
     return EffectOutput(
         message="入口卡片已展示，等待用户选择。",
         extras={
+            **state_delta,
             "docgen_state.entry_mode": mode,
-            "docgen_state.entry_step": state.get("current_step", "mode_selection"),
+            "docgen_state.entry_step": stage,
         },
     )
+
+
+async def _ef_start_show_entry(ictx: InstanceCtx) -> EffectOutput | None:
+    """自启动并展示入口，避免 start/show_entry 并行时丢状态。"""
+    from egis_agent_plugins.core.tools.docgen import service
+
+    start_result = await _ef_start(ictx)
+    state = dict((start_result.extras or {}).get("docgen_state") or {})
+    mode = state.get("mode")
+    if mode in ("standard", "ai"):
+        stage = "template_selection"
+        awaiting = "template"
+    else:
+        mode = None
+        stage = "mode_selection"
+        awaiting = "mode"
+    state = service.merge_dict(
+        state,
+        {
+            "stage": stage,
+            "awaiting": awaiting,
+            "selection": {"mode": mode},
+            "flows": {
+                "entry": {
+                    "stage": stage,
+                    "awaiting": awaiting,
+                },
+            },
+            "ui": {
+                "blocking": True,
+                "component": "docgen_entry",
+                "payload": {"initial_mode": mode} if mode else {},
+            },
+        },
+    )
+    return EffectOutput(
+        message="入口卡片已展示，等待用户选择。",
+        extras={
+            **service.docgen_state_delta(state),
+            "docgen_state.entry_mode": mode,
+            "docgen_state.entry_step": stage,
+        },
+    )
+
+
+async def _ef_select_mode(ictx: InstanceCtx) -> EffectOutput | None:
+    """选择制作方式，不离开入口 flow。"""
+    mode = str(ictx.args.get("mode") or "").strip()
+    if mode not in {"standard", "ai"}:
+        return EffectOutput(message="无效制作方式，请选择 standard 或 ai。")
+
+    stage = "template_selection"
+    ictx.instance_data["mode"] = mode
+    ictx.instance_data["step"] = stage
+    state_delta = _entry_state_delta(
+        ictx,
+        {
+            "mode": mode,
+            "stage": stage,
+            "awaiting": "template",
+            "selection": {"mode": mode},
+            "flows": {
+                "entry": {
+                    "stage": stage,
+                    "awaiting": "template",
+                },
+            },
+        },
+    )
+    return EffectOutput(
+        message=f"已选择制作方式: {mode}",
+        extras={
+            **state_delta,
+            "docgen_state.entry_mode": mode,
+            "docgen_state.entry_step": stage,
+        },
+    )
+
+
+async def _ef_select_template(ictx: InstanceCtx) -> EffectOutput | None:
+    """通用模板选择入口，供不同 agent 复用 entry flow。"""
+    template_id = str(ictx.args.get("template_id") or "").strip()
+    doc_type = _doc_type_from_template(template_id)
+    if not doc_type:
+        return EffectOutput(message=f"未知模板: {template_id}")
+    if doc_type == "ai_word":
+        return await _ef_select_word(ictx)
+    if doc_type == "ai_ppt":
+        return await _ef_select_ppt(ictx)
+    return await _create_project(ictx, doc_type)
 
 
 async def _ef_select_tender(ictx: InstanceCtx) -> EffectOutput | None:
@@ -227,9 +336,31 @@ async def _ef_select_word(ictx: InstanceCtx) -> EffectOutput | None:
     """选择 AI Word 制作。"""
     ictx.instance_data["mode"] = "ai"
     ictx.instance_data["doc_type"] = "ai_word"
+    state_delta = _entry_state_delta(
+        ictx,
+        {
+            "mode": "ai",
+            "template_id": "ai_word",
+            "active_flow": None,
+            "stage": "ai_word_selected",
+            "awaiting": None,
+            "selection": {
+                "mode": "ai",
+                "template_id": "ai_word",
+                "format": "word",
+            },
+            "flows": {
+                "entry": {
+                    "stage": "template_selected",
+                    "awaiting": None,
+                },
+            },
+        },
+    )
     return EffectOutput(
         message="用户选择了 AI Word 制作。请按 wordmaster 技能执行。",
         extras={
+            **state_delta,
             "docgen_state.mode": "ai",
             "docgen_state.doc_type": "ai_word",
         },
@@ -240,9 +371,31 @@ async def _ef_select_ppt(ictx: InstanceCtx) -> EffectOutput | None:
     """选择 AI PPT 制作。"""
     ictx.instance_data["mode"] = "ai"
     ictx.instance_data["doc_type"] = "ai_ppt"
+    state_delta = _entry_state_delta(
+        ictx,
+        {
+            "mode": "ai",
+            "template_id": "ai_ppt",
+            "active_flow": None,
+            "stage": "ai_ppt_selected",
+            "awaiting": None,
+            "selection": {
+                "mode": "ai",
+                "template_id": "ai_ppt",
+                "format": "ppt",
+            },
+            "flows": {
+                "entry": {
+                    "stage": "template_selected",
+                    "awaiting": None,
+                },
+            },
+        },
+    )
     return EffectOutput(
         message="用户选择了 AI PPT 制作。请按 pptmaster 技能执行。",
         extras={
+            **state_delta,
             "docgen_state.mode": "ai",
             "docgen_state.doc_type": "ai_ppt",
         },
@@ -275,23 +428,30 @@ async def _create_project(
     ictx.instance_data["project_id"] = manifest.project_id
     ictx.instance_data["project_path"] = str(project_path)
 
-    entry_state = _load_entry_state(str(project_path)) or {
-        "schema_version": 1,
-        "workflow": "docgen_entry",
-        "project_id": manifest.project_id,
-        "project_path": str(project_path),
-        "history": [],
-    }
-    entry_state.update({
-        "mode": "standard",
-        "doc_type": doc_type,
-        "selected_template": doc_type,
-        "current_step": "routed",
-        "next_action": workflow,
-        "status": "routed",
-    })
-    _append_history(entry_state, "select_template", doc_type=doc_type, workflow=workflow)
-    _save_entry_state(str(project_path), entry_state)
+    template_id = _DOC_TYPE_TEMPLATE.get(doc_type, doc_type)
+    state_delta = _entry_state_delta(
+        ictx,
+        {
+            "project_id": manifest.project_id,
+            "project_path": str(project_path),
+            "mode": "standard",
+            "template_id": template_id,
+            "active_flow": None,
+            "stage": "template_selected",
+            "awaiting": None,
+            "selection": {
+                "mode": "standard",
+                "template_id": template_id,
+                "format": "word",
+            },
+            "flows": {
+                "entry": {
+                    "stage": "template_selected",
+                    "awaiting": None,
+                },
+            },
+        },
+    )
 
     return EffectOutput(
         message=(
@@ -299,11 +459,11 @@ async def _create_project(
             f"请调用对应材料的 flow 启动制作流程。"
         ),
         extras={
+            **state_delta,
             "docgen_state.mode": "standard",
             "docgen_state.doc_type": doc_type,
             "docgen_state.project_id": manifest.project_id,
             "docgen_state.project_path": str(project_path),
-            "docgen_state.entry_state_path": f"templates/{_ENTRY_STATE_FILE}",
         },
     )
 
@@ -330,12 +490,32 @@ class DocgenEntryFlow(Workflow):
 
     transitions: ClassVar[tuple[Transition, ...]] = (
         Transition("start", None, "idle", effect=_ef_start),
+        Transition("start", ANY_STATE, KEEP_STATE, effect=_ef_start),
+        Transition("show_entry", None, "idle", effect=_ef_start_show_entry),
         Transition("show_entry", "idle", "idle", effect=_ef_show_entry),
+        Transition("show_entry", ANY_STATE, KEEP_STATE, effect=_ef_show_entry),
+        Transition("select_mode", None, "idle",
+                   effect=_ef_select_mode, args_schema=SelectModeArgs),
+        Transition("select_mode", "idle", "idle",
+                   effect=_ef_select_mode, args_schema=SelectModeArgs),
+        Transition("select_mode", ANY_STATE, KEEP_STATE,
+                   effect=_ef_select_mode, args_schema=SelectModeArgs),
+        Transition("select_template", None, "routed",
+                   effect=_ef_select_template, args_schema=SelectTemplateArgs),
+        Transition("select_template", "idle", "routed",
+                   effect=_ef_select_template, args_schema=SelectTemplateArgs),
+        Transition("select_template", ANY_STATE, "routed",
+                   effect=_ef_select_template, args_schema=SelectTemplateArgs),
         # 标化
         Transition("select_tender", "idle", "routed", effect=_ef_select_tender),
+        Transition("select_tender", ANY_STATE, "routed", effect=_ef_select_tender),
         Transition("select_pension_intro", "idle", "routed", effect=_ef_select_pension_intro),
+        Transition("select_pension_intro", ANY_STATE, "routed", effect=_ef_select_pension_intro),
         Transition("select_investment_report", "idle", "routed", effect=_ef_select_investment_report),
+        Transition("select_investment_report", ANY_STATE, "routed", effect=_ef_select_investment_report),
         # AI
         Transition("select_word", "idle", "routed", effect=_ef_select_word),
+        Transition("select_word", ANY_STATE, "routed", effect=_ef_select_word),
         Transition("select_ppt", "idle", "routed", effect=_ef_select_ppt),
+        Transition("select_ppt", ANY_STATE, "routed", effect=_ef_select_ppt),
     )
