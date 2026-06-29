@@ -523,6 +523,7 @@ class MilvusClient:
         retriever_type: RetrieverType | str = RetrieverType.VECTOR,
         knowledge_ids: list[str] | None = None,
         tag_ids: list[str] | None = None,
+        filter_expr: str | None = None,
         top_k: int = 10,
     ) -> list[MilvusSearchResult]:
         """跨多 collection 检索 + RRF 聚合
@@ -543,6 +544,8 @@ class MilvusClient:
             retriever_type: 检索类型。
             knowledge_ids: 文件级精确过滤（跨 collection 共用）。
             tag_ids: 标签 OR 过滤（跨 collection 共用）。
+            filter_expr: 完整 Milvus 过滤表达式。提供时优先使用，用于
+                ``kb AND (tag OR file)`` 这类结构化前端范围。
             top_k: 最终返回条数。
 
         Returns:
@@ -560,6 +563,7 @@ class MilvusClient:
                 retriever_type=retriever_type,
                 knowledge_ids=knowledge_ids,
                 tag_ids=tag_ids,
+                filter_expr=filter_expr,
                 top_k=top_k,
             )
 
@@ -582,6 +586,7 @@ class MilvusClient:
                 knowledge_base_ids=kb_ids or None,
                 knowledge_ids=knowledge_ids,
                 tag_ids=tag_ids,
+                filter_expr=filter_expr,
                 top_k=per_collection_topk,
                 collection_name=collection_name,
             )

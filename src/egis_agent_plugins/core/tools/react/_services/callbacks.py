@@ -44,6 +44,10 @@ from typing import Any
 from ark_agentic.core.runtime.callbacks import CallbackResult, RunnerCallbacks
 from ark_agentic.core.types import AgentMessage
 
+from egis_agent_plugins.core.flows.rag._services.tool_call_scope import (
+    inject_rag_scope_into_tool_calls,
+)
+
 from .planning_guard import build_planning_callbacks
 from .run_mode import (
     RunMode,
@@ -80,6 +84,7 @@ def build_react_callbacks(
     ) -> CallbackResult | None:
         mode = resolve_run_mode(ctx.input_context, agent_id=agent_id)
         set_current_run_mode(mode)
+        inject_rag_scope_into_tool_calls(ctx, response)
         if mode == RunMode.FLASH:
             return None
 

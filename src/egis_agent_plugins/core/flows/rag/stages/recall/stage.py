@@ -7,11 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from egis_agent_plugins.core.flows.rag.clients import RAGClients
+from egis_agent_plugins.core.flows.rag._services.scope_adapter import (
+    RecallScope,
+    scope_plan_from_filters_or_context,
+    scopes_from_flat_filters,
+)
 from egis_agent_plugins.core.service.base import RetrieverType
 from egis_agent_plugins.core.flows.rag.stages.recall.collections import (
     group_by_collection,
@@ -115,6 +121,26 @@ def _build_kb_meta_groups(
     return {default_collection: list(resolved.kb_ids or [])}
 
 
+def _collection_groups_for_scope(
+    clients: RAGClients,
+    resolved: ResolvedFilters,
+    scope: RecallScope,
+) -> dict[str, list[str]] | None:
+    """Return collection routing groups for one scope."""
+    if not scope.kb_id:
+        return None
+    metas = [meta for meta in resolved.kb_metas if meta.id == scope.kb_id]
+    if metas:
+        cfg = clients.milvus._config
+        return group_by_collection(
+            metas,
+            personal_collection=cfg.personal_collection,
+            public_collection=cfg.public_collection,
+        )
+    default_collection = clients.milvus._config.personal_collection
+    return {default_collection: [scope.kb_id]}
+
+
 async def _resolve_collection_groups(
     clients: RAGClients,
     resolved: ResolvedFilters,
@@ -172,6 +198,7 @@ def _milvus_search_with_embedding(
     query_embedding: list[float],
     resolved: ResolvedFilters,
     collection_groups: dict[str, list[str]] | None,
+    filter_expr: str | None = None,
     top_k: int,
 ) -> list[SearchResult]:
     """同步 Milvus 检索（hybrid 优先，失败回退 vector）。"""
@@ -186,6 +213,7 @@ def _milvus_search_with_embedding(
                 retriever_type=RetrieverType.HYBRID,
                 knowledge_ids=resolved.knowledge_ids or None,
                 tag_ids=resolved.tag_ids or None,
+                filter_expr=filter_expr,
                 top_k=top_k * 2,
             )
             return [
@@ -208,6 +236,7 @@ def _milvus_search_with_embedding(
             retriever_type=RetrieverType.VECTOR,
             knowledge_ids=resolved.knowledge_ids or None,
             tag_ids=resolved.tag_ids or None,
+            filter_expr=filter_expr,
             top_k=top_k * 2,
         )
         return [
@@ -232,6 +261,34 @@ def _deduplicate_results(results: list[SearchResult]) -> list[SearchResult]:
         seen.add(r.chunk_id)
         deduplicated.append(r)
     return deduplicated
+
+
+def _scope_with_selected_documents(
+    scope: RecallScope,
+    selected_documents: list[dict[str, Any]],
+) -> RecallScope:
+    """Narrow a UI/tag scope to the documents selected by the summary stage.
+
+    Explicit file selections are kept. Once select_documents has produced
+    documents for a scope, tag selectors should not expand recall back to the
+    whole tag; recall should read selected docs plus explicitly selected files.
+    """
+    selected_ids = [
+        str(doc.get("knowledge_id", "")).strip()
+        for doc in selected_documents
+        if str(doc.get("knowledge_id", "")).strip()
+        and (not scope.kb_id or doc.get("knowledge_base_id") == scope.kb_id)
+    ]
+    if not selected_ids:
+        return scope
+    return RecallScope(
+        kb_id=scope.kb_id,
+        kb_name=scope.kb_name,
+        tag_ids=[],
+        knowledge_ids=list(dict.fromkeys([*scope.knowledge_ids, *selected_ids])),
+        file_names=list(scope.file_names),
+        source=scope.source,
+    )
 
 
 async def _fill_knowledge_titles(clients: RAGClients, results: list[SearchResult]) -> None:
@@ -327,7 +384,15 @@ async def run(
     forced_kbs, forced_tags, forced_files = read_forced_filters(ctx)
     queries = args.get("queries", [])
 
-    kb_ids_raw = forced_kbs if forced_kbs is not None else (args.get("knowledge_base_ids") or clients.default_kb_ids)
+    scope_plan = scope_plan_from_filters_or_context(args, ctx)
+    scoped_kb_ids = scope_plan.flat_kb_ids() if scope_plan.has_scopes else []
+
+    kb_ids_raw = (
+        scoped_kb_ids
+        or (forced_kbs if forced_kbs is not None else None)
+        or args.get("knowledge_base_ids")
+        or clients.default_kb_ids
+    )
     kb_ids_in = _ensure_str_list(kb_ids_raw) or kb_ids_raw
     kb_names = None if forced_kbs is not None else (args.get("kb_names") or None)
     knowledge_ids_in = _ensure_str_list(forced_files if forced_files is not None else (args.get("knowledge_ids") or None))
@@ -372,41 +437,90 @@ async def run(
         effective_queries = [q for q in queries if q and q.strip()]
         if not effective_queries:
             return {"error": "queries 全为空"}
+        recall_queries = effective_queries[:1] if scope_plan.has_scopes else effective_queries
 
         # 批量 embedding
         _t_embed = time.perf_counter()
         try:
-            embeddings = await clients.embedding.embed_queries(effective_queries)
+            embeddings = await clients.embedding.embed_queries(recall_queries)
         except Exception as e:
             logger.warning("[KnowledgeSearch] embed_queries 失败，回退单条: %s", e)
             embeddings = await asyncio.gather(
-                *[clients.embedding.embed_query(q) for q in effective_queries]
+                *[clients.embedding.embed_query(q) for q in recall_queries]
             )
         logger.info("[KS] stage=embed cost_ms=%d", int((time.perf_counter() - _t_embed) * 1000))
 
-        collection_groups = await _resolve_collection_groups(clients, resolved)
+        scopes = (
+            scope_plan.scopes
+            if scope_plan.has_scopes
+            else scopes_from_flat_filters(
+                kb_ids=resolved.kb_ids,
+                tag_ids=resolved.tag_ids,
+                knowledge_ids=resolved.knowledge_ids,
+            )
+        )
+        if not scopes:
+            scopes = [RecallScope()]
+
+        selected_documents = args.get("selected_documents") or []
+        scopes = [
+            _scope_with_selected_documents(scope, selected_documents)
+            for scope in scopes
+        ]
+
+        fallback_collection_groups = await _resolve_collection_groups(clients, resolved)
 
         # 多 query 并发 Milvus 检索
         _t_milvus = time.perf_counter()
-        search_tasks = [
-            asyncio.to_thread(
-                _milvus_search_with_embedding,
-                clients,
-                query=q,
-                query_embedding=emb,
-                resolved=resolved,
-                collection_groups=collection_groups,
-                top_k=top_k,
+        sem = asyncio.Semaphore(int(os.getenv("RAG_SCOPE_RECALL_CONCURRENCY", "3")))
+
+        async def _search_scope_query(scope: RecallScope, q: str, emb: list[float]) -> list[SearchResult]:
+            scope_groups = _collection_groups_for_scope(clients, resolved, scope)
+            collection_groups = scope_groups or fallback_collection_groups
+            filter_expr = scope.to_filter_expr(include_enabled=True)
+            scope_resolved = ResolvedFilters(
+                kb_ids=[scope.kb_id] if scope.kb_id else resolved.kb_ids,
+                kb_metas=[
+                    meta for meta in resolved.kb_metas
+                    if not scope.kb_id or meta.id == scope.kb_id
+                ],
+                tag_ids=list(scope.tag_ids),
+                knowledge_ids=list(scope.knowledge_ids),
             )
-            for q, emb in zip(effective_queries, embeddings)
+            async with sem:
+                results = await asyncio.to_thread(
+                    _milvus_search_with_embedding,
+                    clients,
+                    query=q,
+                    query_embedding=emb,
+                    resolved=scope_resolved,
+                    collection_groups=collection_groups,
+                    filter_expr=filter_expr,
+                    top_k=top_k,
+                )
+            for item in results:
+                item.query_type = f"{item.query_type}:scoped"
+            logger.info(
+                "[KnowledgeSearch] scope=%s query='%s' results=%d filter=%s",
+                scope.kb_id or "*",
+                q[:40],
+                len(results),
+                filter_expr,
+            )
+            return results
+
+        search_tasks = [
+            _search_scope_query(scope, q, emb)
+            for scope in scopes
+            for q, emb in zip(recall_queries, embeddings)
         ]
         per_query_results = await asyncio.gather(*search_tasks, return_exceptions=True)
         logger.info("[KS] stage=milvus cost_ms=%d", int((time.perf_counter() - _t_milvus) * 1000))
 
         all_results: list[SearchResult] = []
-        for q, res in zip(effective_queries, per_query_results):
+        for res in per_query_results:
             if isinstance(res, Exception):
-                logger.warning("[KnowledgeSearch] query='%s' 检索失败: %s", q, res)
+                logger.warning("[KnowledgeSearch] scoped query 检索失败: %s", res)
                 continue
             all_results.extend(res)
 
@@ -418,6 +532,7 @@ async def run(
                 "knowledge_base_ids": resolved.kb_ids,
                 "tag_ids": resolved.tag_ids,
                 "knowledge_ids": resolved.knowledge_ids,
+                "scope_count": len(scopes),
                 "summary": _format_empty_output(queries, resolved.kb_ids),
             }
 
@@ -440,6 +555,7 @@ async def run(
             "knowledge_base_ids": resolved.kb_ids,
             "tag_ids": resolved.tag_ids,
             "knowledge_ids": resolved.knowledge_ids,
+            "scope_count": len(scopes),
             "display_type": "search_results",
             "summary": output,
         }

@@ -28,6 +28,7 @@ from egis_agent_plugins.core.internal.a2ui import (
 )
 from egis_agent_plugins.core.flows.rag.clients import RAGClients
 
+from ._services.scope_adapter import read_rag_state
 from .workflow import RagRetrievalWorkflow
 
 logger = logging.getLogger(__name__)
@@ -74,8 +75,12 @@ class RagTool(AgentTool):
         ToolParameter(
             name="filters",
             type="object",
-            description="过滤条件：knowledge_base_ids（知识库ID列表）、knowledge_ids（文档ID列表）、"
-                        "tag_ids（标签ID列表）、kb_names（知识库名称）、file_names（文件名）、tag_names（标签名）",
+            description=(
+                "资料范围过滤条件。前端指定范围时由系统直接注入 filters.rag_filter，"
+                "结构为 [{kb_id,kb_name,tags:[{tag_id,tag_name,files:[{id,name,type}]}],files:[...]}]。"
+                "不要把层级范围简化成 kb_id/tag_ids/file_ids；同一知识库内 tag 与 file 是 OR 关系，"
+                "不同知识库分开查询。"
+            ),
             required=False,
         ),
         ToolParameter(
@@ -119,6 +124,41 @@ class RagTool(AgentTool):
         return {}
 
     @staticmethod
+    def _read_frontend_rag_filter(ctx: dict[str, Any]) -> list[dict[str, Any]] | None:
+        """Read frontend scope from tool context.
+
+        The frontend scope is request/runtime state, not something the LLM
+        should be trusted to synthesize. The after-model callback injects it
+        before tool tracing; this method is the execution-time fallback.
+        """
+        rag_state = read_rag_state(ctx)
+        raw = rag_state.get("rag_filter") or rag_state.get("rag_filters")
+        if not isinstance(raw, list):
+            return None
+        scopes = [item for item in raw if isinstance(item, dict)]
+        return scopes or None
+
+    @classmethod
+    def _inject_frontend_filters(
+        cls,
+        *,
+        args: dict[str, Any],
+        ctx: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge frontend RAG scope into tool arguments for execution and trace."""
+        filters = cls._parse_filters(args.get("filters"))
+        rag_filter = cls._read_frontend_rag_filter(ctx)
+        if not rag_filter:
+            args["filters"] = filters
+            return filters
+
+        merged = dict(filters)
+        merged["rag_filter"] = rag_filter
+        args["filters"] = merged
+        logger.info("[RagRetrieval] injected frontend rag_filter into tool filters: scopes=%d", len(rag_filter))
+        return merged
+
+    @staticmethod
     def _parse_int(raw: Any, *, default: int = 0) -> int:
         """Parse an integer from a possibly-string value."""
         if raw is None:
@@ -154,7 +194,7 @@ class RagTool(AgentTool):
 
         query = args.get("query", "")
         source = args.get("source", "auto")
-        filters = self._parse_filters(args.get("filters"))
+        filters = self._inject_frontend_filters(args=args, ctx=ctx)
         max_retries = self._parse_int(args.get("max_retries"), default=1)
 
         if not query.strip():

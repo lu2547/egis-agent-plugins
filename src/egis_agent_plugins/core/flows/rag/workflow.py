@@ -50,7 +50,7 @@ from .stages.rewrite.stage import run as _rewrite_run
 from .stages.select.stage import run as _select_run
 
 # 前端 rag_state 硬覆盖过滤器
-from egis_agent_plugins.core.flows.rag.state import read_forced_filters
+from egis_agent_plugins.core.flows.rag._services.scope_adapter import read_rag_state
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,17 @@ logger = logging.getLogger(__name__)
 
 def _has_doc_scope(filters: dict[str, Any]) -> bool:
     """Whether the user explicitly constrained retrieval to documents/files."""
-    return bool(filters.get("knowledge_ids") or filters.get("file_names"))
+    if filters.get("knowledge_ids") or filters.get("file_names"):
+        return True
+    for kb in filters.get("rag_filter") or []:
+        if not isinstance(kb, dict):
+            continue
+        if kb.get("files"):
+            return True
+        for tag in kb.get("tags") or kb.get("tag") or []:
+            if isinstance(tag, dict) and tag.get("files"):
+                return True
+    return False
 
 
 def _has_kb_or_tag_scope(filters: dict[str, Any]) -> bool:
@@ -70,6 +80,7 @@ def _has_kb_or_tag_scope(filters: dict[str, Any]) -> bool:
         or filters.get("kb_names")
         or filters.get("tag_ids")
         or filters.get("tag_names")
+        or filters.get("rag_filter")
     )
 
 
@@ -206,15 +217,13 @@ class RagRetrievalWorkflow(Workflow):
         )
         ictx.instance_data.update(data)
 
-        # 合并前端 rag_state 硬覆盖过滤器到 filters
-        forced_kbs, forced_tags, forced_files = read_forced_filters(ictx.session_ctx)
+        # Mirror frontend hierarchical scope into workflow filters without flattening.
         filters = ictx.instance_data.setdefault("filters", {}) or {}
-        if forced_kbs is not None:
-            filters["knowledge_base_ids"] = forced_kbs
-        if forced_tags is not None:
-            filters["tag_ids"] = forced_tags
-        if forced_files is not None:
-            filters["knowledge_ids"] = forced_files
+        if not filters.get("rag_filter"):
+            rag_state = read_rag_state(ictx.session_ctx)
+            rag_filter = rag_state.get("rag_filter") or rag_state.get("rag_filters")
+            if isinstance(rag_filter, list) and rag_filter:
+                filters["rag_filter"] = rag_filter
 
         ictx.instance_data["timings"]["start_ms"] = int((time.perf_counter() - t0) * 1000)
         return None
@@ -329,6 +338,8 @@ class RagRetrievalWorkflow(Workflow):
             sd_args["tag_ids"] = filters["tag_ids"]
         if filters.get("tag_names"):
             sd_args["tag_names"] = filters["tag_names"]
+        if filters.get("rag_filter"):
+            sd_args["rag_filter"] = filters["rag_filter"]
 
         try:
             result = await _select_run(clients=self._clients, args=sd_args, ctx=ctx)
@@ -349,6 +360,7 @@ class RagRetrievalWorkflow(Workflow):
             return None
         kid_list = result.get("knowledge_ids", [])
         ictx.instance_data["selected_knowledge_ids"] = kid_list
+        ictx.instance_data["selected_documents"] = result.get("documents", [])
         logger.info("[RAG WF] select_documents → %d docs", len(kid_list))
 
         if kid_list:
@@ -380,7 +392,10 @@ class RagRetrievalWorkflow(Workflow):
         keywords = rewrite.get("keywords", [])
 
         # Build queries list: rewrite_query + sub_queries (deduplicated, max 5)
+        original_query = ictx.instance_data.get("query", "")
         queries = [query] if query else []
+        if original_query and original_query not in queries:
+            queries.append(original_query)
         for sq in sub_queries:
             if sq and sq not in queries:
                 queries.append(sq)
@@ -397,6 +412,9 @@ class RagRetrievalWorkflow(Workflow):
         kid_list = ictx.instance_data.get("selected_knowledge_ids") or []
         if kid_list:
             ks_args["knowledge_ids"] = kid_list
+        selected_documents = ictx.instance_data.get("selected_documents") or []
+        if selected_documents:
+            ks_args["selected_documents"] = selected_documents
 
         # Pass filters
         filters = ictx.instance_data.get("filters") or {}
@@ -410,6 +428,8 @@ class RagRetrievalWorkflow(Workflow):
             ks_args["tag_names"] = filters["tag_names"]
         if filters.get("file_names"):
             ks_args["file_names"] = filters["file_names"]
+        if filters.get("rag_filter"):
+            ks_args["rag_filter"] = filters["rag_filter"]
 
         candidates: list[dict[str, Any]] = []
         try:
@@ -418,6 +438,8 @@ class RagRetrievalWorkflow(Workflow):
             logger.warning("[RAG WF] knowledge_search failed: %s", e)
             result = {}
         raw_results = result.get("results", [])
+        if result.get("scope_count") is not None:
+            ictx.instance_data["scope_count"] = result.get("scope_count")
         # 诊断：recall 返回结果来源
         raw_kids = list(set(sr.get("knowledge_id", "") for sr in raw_results if sr.get("knowledge_id")))
         raw_titles = list(set(sr.get("knowledge_title", "") for sr in raw_results if sr.get("knowledge_title")))
@@ -828,6 +850,14 @@ class RagRetrievalWorkflow(Workflow):
                 "_rag_evidence_refs": evidence_refs,
                 "_rag_evidence_pack": {
                     "query": ictx.instance_data.get("query", ""),
+                    "query_plan": {
+                        "original": ictx.instance_data.get("query", ""),
+                        "rewrite": (ictx.instance_data.get("rewrite") or {}).get("rewrite_query", ""),
+                        "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
+                        "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
+                    },
+                    "route": ictx.instance_data.get("route"),
+                    "scope_count": ictx.instance_data.get("scope_count", 0),
                     "references": refs,
                     "evidence_count": len(ictx.instance_data.get("evidence", [])),
                     "timings": ictx.instance_data.get("timings", {}),
@@ -876,6 +906,14 @@ class RagRetrievalWorkflow(Workflow):
                 "_rag_evidence_refs": evidence_refs,
                 "_rag_evidence_pack": {
                     "query": ictx.instance_data.get("query", ""),
+                    "query_plan": {
+                        "original": ictx.instance_data.get("query", ""),
+                        "rewrite": (ictx.instance_data.get("rewrite") or {}).get("rewrite_query", ""),
+                        "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
+                        "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
+                    },
+                    "route": ictx.instance_data.get("route"),
+                    "scope_count": ictx.instance_data.get("scope_count", 0),
                     "references": refs,
                     "evidence_count": len(ranked),
                     "partial": True,

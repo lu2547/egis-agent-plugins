@@ -5,11 +5,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from typing import Any
 
 from egis_agent_plugins.core.flows.rag.clients import RAGClients
+from egis_agent_plugins.core.flows.rag._services.scope_adapter import (
+    RecallScope,
+    scope_plan_from_filters_or_context,
+    scopes_from_flat_filters,
+)
 from egis_agent_plugins.core.flows.rag.filters import (
     ResolvedFilters,
     resolve_filters,
@@ -138,6 +145,18 @@ def _format_output(documents: list[dict], query: str) -> str:
     return "\n".join(lines)
 
 
+def _dedup_documents(documents: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+    for doc in sorted(documents, key=lambda d: float(d.get("score", 0.0)), reverse=True):
+        kid = doc.get("knowledge_id", "")
+        if not kid or kid in seen:
+            continue
+        seen.add(kid)
+        out.append(doc)
+    return out
+
+
 # ── Stage entrypoint ───────────────────────────────────────────────────────
 
 
@@ -153,7 +172,15 @@ async def run(
     if not query:
         return {"error": "query 参数不能为空"}
 
-    kb_ids_raw = forced_kbs if forced_kbs is not None else (args.get("knowledge_base_ids") or clients.default_kb_ids)
+    scope_plan = scope_plan_from_filters_or_context(args, ctx)
+    scoped_kb_ids = scope_plan.flat_kb_ids() if scope_plan.has_scopes else []
+
+    kb_ids_raw = (
+        scoped_kb_ids
+        or (forced_kbs if forced_kbs is not None else None)
+        or args.get("knowledge_base_ids")
+        or clients.default_kb_ids
+    )
     kb_ids_in = _ensure_str_list(kb_ids_raw) or kb_ids_raw
     kb_names = None if forced_kbs is not None else (args.get("kb_names") or None)
     file_name_keywords = args.get("file_name_keywords") or None
@@ -197,12 +224,18 @@ async def run(
         query_embedding = await clients.embedding.embed_query(query)
         logger.info("[SelectDocuments] stage=embed cost_ms=%d", int((time.perf_counter() - _t_embed) * 1000))
 
-        filter_expr = _build_filter(
-            kb_ids=resolved.kb_ids or None,
-            tag_ids=resolved.tag_ids or None,
-            knowledge_ids=resolved.knowledge_ids or None,
-            file_name_keywords=file_name_keywords,
+        scopes = (
+            scope_plan.scopes
+            if scope_plan.has_scopes
+            else scopes_from_flat_filters(
+                kb_ids=resolved.kb_ids,
+                tag_ids=resolved.tag_ids,
+                knowledge_ids=resolved.knowledge_ids,
+                file_names=file_name_keywords or [],
+            )
         )
+        if not scopes:
+            scopes = [RecallScope()]
 
         clients.milvus.ensure_collection_loaded(summary_collection)
 
@@ -211,19 +244,51 @@ async def run(
             "metric_type": clients.milvus._config.milvus_metric_type,
             "params": {"nprobe": 10},
         }
-        raw_results = clients.milvus.client.search(
-            collection_name=summary_collection,
-            data=[query_embedding],
-            anns_field=SUMMARY_ANNS_FIELD,
-            limit=top_k,
-            output_fields=SUMMARY_OUTPUT_FIELDS,
-            search_params=search_params,
-            filter=filter_expr,
+
+        sem = asyncio.Semaphore(int(os.getenv("RAG_SCOPE_SELECT_CONCURRENCY", "3")))
+
+        async def _search_scope(scope: RecallScope) -> list[dict]:
+            filter_expr = scope.to_filter_expr(include_enabled=True)
+            async with sem:
+                raw = await asyncio.to_thread(
+                    clients.milvus.client.search,
+                    collection_name=summary_collection,
+                    data=[query_embedding],
+                    anns_field=SUMMARY_ANNS_FIELD,
+                    limit=top_k,
+                    output_fields=SUMMARY_OUTPUT_FIELDS,
+                    search_params=search_params,
+                    filter=filter_expr,
+                )
+            docs = _parse_summary_results(raw)
+            for doc in docs:
+                doc["scope"] = {
+                    "kb_id": scope.kb_id,
+                    "kb_name": scope.kb_name,
+                    "source": scope.source,
+                }
+            logger.info(
+                "[SelectDocuments] scope=%s docs=%d filter=%s",
+                scope.kb_id or "*",
+                len(docs),
+                filter_expr,
+            )
+            return docs
+
+        scope_results = await asyncio.gather(
+            *(_search_scope(scope) for scope in scopes),
+            return_exceptions=True,
         )
         logger.info("[SelectDocuments] stage=milvus cost_ms=%d", int((time.perf_counter() - _t_milvus) * 1000))
 
-        documents = _parse_summary_results(raw_results)
-        logger.info("[SelectDocuments] DIAG: parsed docs=%d, filter=%s", len(documents), filter_expr)
+        documents: list[dict] = []
+        for result in scope_results:
+            if isinstance(result, Exception):
+                logger.warning("[SelectDocuments] scoped search failed: %s", result)
+                continue
+            documents.extend(result)
+        documents = _dedup_documents(documents)
+        logger.info("[SelectDocuments] DIAG: parsed docs=%d, scopes=%d", len(documents), len(scopes))
 
         if not documents:
             return {
@@ -250,4 +315,3 @@ async def run(
     except Exception as e:
         logger.error("[SelectDocuments] 检索失败: %s", e)
         return {"error": f"文档选择失败: {e}"}
-

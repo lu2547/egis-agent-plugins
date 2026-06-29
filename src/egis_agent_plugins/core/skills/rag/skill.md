@@ -13,6 +13,10 @@ rag(query="用户原始问题", source="auto", filters={}, max_retries=1)
 
 不要手动拆成多个检索子步骤；检索编排由 workflow 负责。
 
+如果用户已经在前端指定资料范围，系统会把完整的
+`rag_state.rag_filter` 注入到 `filters.rag_filter`。不要自行把范围改写成
+`kb_id`、`tag_ids`、`file_ids` 等扁平字段；层级关系由 RAG workflow 解析。
+
 不需要检索的纯问候、感谢、道别或普通续聊，直接调用 `final_answer`。
 
 ## 回答约束
