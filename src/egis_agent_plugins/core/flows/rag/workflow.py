@@ -504,12 +504,12 @@ class RagRetrievalWorkflow(Workflow):
         return None
 
     async def _ef_parallel_read_and_assess(self, ictx: InstanceCtx) -> EffectOutput | None:
-        """Deep-read full small docs or continuous windows around reranked chunks.
+        """Deep-read full small docs or dynamically expand short anchor chunks.
 
-        Small selected documents are cheap and safest to read in full. Large
-        documents are expanded from reranked anchors with a local chunk window;
-        this preserves context without replacing child chunks with parent
-        chunks or reading unrelated document starts.
+        Small selected documents are cheap and safest to read in full. For large
+        documents, anchors whose content >= EXPAND_MIN_LEN (350) are used directly;
+        short anchors (< 350 chars) are expanded by reading up to EXPAND_MAX_CHUNKS
+        (10) adjacent chunks, capped at EXPAND_MAX_LEN (1000) total characters.
         """
         t0 = time.perf_counter()
         ctx = ictx.session_ctx
@@ -525,10 +525,10 @@ class RagRetrievalWorkflow(Workflow):
         top_items = ranked[:top_k]
         evidence: list[dict[str, Any]] = []
 
-        window = max(
-            0,
-            int(os.getenv("RAG_CHUNK_WINDOW", os.getenv("RAG_DEEP_CHUNK_WINDOW", "10"))),
-        )
+        # -- Dynamic expansion parameters (similar to weknora) --
+        expand_min_len = int(os.getenv("RAG_EXPAND_MIN_LEN", "350"))
+        expand_max_len = int(os.getenv("RAG_EXPAND_MAX_LEN", "1000"))
+        expand_max_chunks = int(os.getenv("RAG_EXPAND_MAX_CHUNKS", "10"))
         small_doc_limit = max(1, int(os.getenv("RAG_SMALL_DOC_CHUNK_LIMIT", "50")))
 
         anchors_by_kid: dict[str, list[dict[str, Any]]] = {}
@@ -574,6 +574,7 @@ class RagRetrievalWorkflow(Workflow):
                 total = doc_counts.get(kid)
                 anchors = anchors_by_kid.get(kid, [])
 
+                # Small doc: read in full.
                 if total is not None and 0 < total <= small_doc_limit:
                     anchor = anchors[0] if anchors else {"knowledge_id": kid}
                     read_specs.append({
@@ -590,159 +591,204 @@ class RagRetrievalWorkflow(Workflow):
                     })
                     continue
 
-                if not anchors or window <= 0:
+                if not anchors:
                     continue
 
-                intervals: list[tuple[int, int]] = []
+                # -- Dynamic context expansion per anchor --
                 for anchor in anchors:
-                    try:
-                        chunk_index = int(anchor.get("chunk_index", 0) or 0)
-                    except (TypeError, ValueError):
-                        chunk_index = 0
-                    start = max(chunk_index - window, 0)
-                    end = chunk_index + window
-                    if total is not None and total > 0:
-                        end = min(end, total - 1)
-                    intervals.append((start, end))
+                    anchor_content = (anchor.get("content") or "").strip()
+                    anchor_chunk_id = anchor.get("chunk_id", anchor.get("id", ""))
 
-                intervals.sort()
-                merged: list[tuple[int, int]] = []
-                for start, end in intervals:
-                    if not merged or start > merged[-1][1] + 1:
-                        merged.append((start, end))
+                    if len(anchor_content) >= expand_min_len:
+                        # Large chunk: use directly, no expansion needed.
+                        evidence.append({
+                            "knowledge_id": kid,
+                            "knowledge_title": anchor.get("knowledge_title", ""),
+                            "chunk_id": anchor_chunk_id,
+                            "chunk_index": anchor.get("chunk_index", 0),
+                            "content": anchor_content,
+                            "score": anchor.get("score", 0.0),
+                            "anchor_score": anchor.get("score", 0.0),
+                            "source_query": anchor.get("source_query", ""),
+                            "anchor_chunk_id": anchor_chunk_id,
+                            "anchor_chunk_ids": [anchor_chunk_id],
+                            "is_anchor": True,
+                            "read_mode": "direct",
+                        })
                     else:
-                        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-
-                anchor_ids = {
-                    a.get("chunk_id", a.get("id", "")) for a in anchors
-                    if a.get("chunk_id", a.get("id", ""))
-                }
-                for start, end in merged:
-                    window_anchors = []
-                    for anchor in anchors:
+                        # Short chunk: needs context expansion.
                         try:
-                            anchor_index = int(anchor.get("chunk_index", 0) or 0)
+                            center_idx = int(anchor.get("chunk_index", 0) or 0)
                         except (TypeError, ValueError):
-                            anchor_index = 0
-                        if start <= anchor_index <= end:
-                            window_anchors.append(anchor)
-                    read_specs.append({
-                        "mode": "anchor_window",
-                        "anchor": window_anchors[0] if window_anchors else anchors[0],
-                        "anchors": window_anchors or anchors,
-                        "knowledge_id": kid,
-                        "offset": start,
-                        "limit": end - start + 1,
-                        "anchor_chunk_ids": anchor_ids,
-                    })
+                            center_idx = 0
+                        read_specs.append({
+                            "mode": "expand_context",
+                            "anchor": anchor,
+                            "anchors": [anchor],
+                            "knowledge_id": kid,
+                            "center_index": center_idx,
+                            "anchor_chunk_ids": {anchor_chunk_id} if anchor_chunk_id else set(),
+                        })
 
-            seen_specs: set[tuple[str, int, int]] = set()
-            deduped_specs: list[dict[str, Any]] = []
-            for spec in read_specs:
-                key = (
-                    spec["knowledge_id"],
-                    int(spec["offset"]),
-                    int(spec["limit"]),
-                )
-                if key in seen_specs:
+            # -- Execute full_small_doc reads (via existing list-chunks) --
+            small_doc_specs = [s for s in read_specs if s["mode"] == "full_small_doc"]
+            expand_specs = [s for s in read_specs if s["mode"] == "expand_context"]
+
+            # Deduplicate small doc reads
+            seen_small: set[str] = set()
+            deduped_small: list[dict[str, Any]] = []
+            for spec in small_doc_specs:
+                kid = spec["knowledge_id"]
+                if kid in seen_small:
                     continue
-                seen_specs.add(key)
-                deduped_specs.append(spec)
+                seen_small.add(kid)
+                deduped_small.append(spec)
 
-            read_tasks: list[tuple[dict[str, Any], Any]] = []
-            for spec in deduped_specs:
-                read_tasks.append((
-                    spec,
-                    _read_run(
-                        clients=self._clients,
-                        args={
-                            "knowledge_id": spec["knowledge_id"],
-                            "offset": spec["offset"],
-                            "limit": spec["limit"],
-                        },
-                        ctx=ctx,
-                    ),
-                ))
-
-            results = await asyncio.gather(
-                *(task for _item, task in read_tasks),
-                return_exceptions=True,
-            )
-            seen_chunks: set[str] = set()
-            for (spec, _task), result in zip(read_tasks, results):
-                anchor = spec.get("anchor") or {}
-                anchors = spec.get("anchors") or []
-                anchor_by_chunk_id = {
-                    a.get("chunk_id", a.get("id", "")): a
-                    for a in anchors
-                    if a.get("chunk_id", a.get("id", ""))
-                }
-                if isinstance(result, Exception):
-                    logger.warning(
-                        "[RAG WF] deep read %s failed: %s",
-                        spec.get("knowledge_id", ""),
-                        result,
+            # Read small docs via _read_run
+            if deduped_small:
+                small_tasks = [
+                    (
+                        spec,
+                        _read_run(
+                            clients=self._clients,
+                            args={
+                                "knowledge_id": spec["knowledge_id"],
+                                "offset": spec["offset"],
+                                "limit": spec["limit"],
+                            },
+                            ctx=ctx,
+                        ),
                     )
-                    continue
-                chunks = result.get("chunks", result.get("results", []))
-                title = (
-                    result.get("knowledge_title")
-                    or anchor.get("knowledge_title", "")
+                    for spec in deduped_small
+                ]
+                small_results = await asyncio.gather(
+                    *(task for _spec, task in small_tasks),
+                    return_exceptions=True,
                 )
-                anchor_chunk_ids = spec.get("anchor_chunk_ids") or set()
-                for chunk in chunks:
-                    chunk_id = chunk.get("chunk_id", chunk.get("id", ""))
-                    content = (chunk.get("content") or "").strip()
-                    if not chunk_id or chunk_id in seen_chunks or not content:
+                seen_chunks: set[str] = set()
+                for (spec, _task), result in zip(small_tasks, small_results):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "[RAG WF] small doc read %s failed: %s",
+                            spec.get("knowledge_id", ""), result,
+                        )
                         continue
-                    seen_chunks.add(chunk_id)
-                    evidence_kid = (
-                        anchor.get("knowledge_id")
-                        or chunk.get("knowledge_id")
-                        or spec.get("knowledge_id", "")
-                    )
-                    is_anchor = chunk_id in anchor_by_chunk_id
-                    matched_anchor = anchor_by_chunk_id.get(chunk_id)
-                    if not matched_anchor and anchors:
-                        try:
-                            chunk_index = int(chunk.get("chunk_index", 0) or 0)
-                        except (TypeError, ValueError):
-                            chunk_index = 0
+                    anchor = spec.get("anchor") or {}
+                    anchors_list = spec.get("anchors") or []
+                    anchor_chunk_ids = spec.get("anchor_chunk_ids") or set()
+                    chunks = result.get("chunks", result.get("results", []))
+                    title = result.get("knowledge_title") or anchor.get("knowledge_title", "")
+                    for chunk in chunks:
+                        chunk_id = chunk.get("chunk_id", chunk.get("id", ""))
+                        content = (chunk.get("content") or "").strip()
+                        if not chunk_id or chunk_id in seen_chunks or not content:
+                            continue
+                        seen_chunks.add(chunk_id)
+                        is_anchor = chunk_id in anchor_chunk_ids
+                        evidence.append({
+                            "knowledge_id": spec["knowledge_id"],
+                            "knowledge_title": title,
+                            "chunk_id": chunk_id,
+                            "chunk_index": chunk.get("chunk_index", 0),
+                            "content": content,
+                            "score": anchor.get("score", 0.0) if is_anchor else 0.0,
+                            "anchor_score": anchor.get("score", 0.0),
+                            "source_query": anchor.get("source_query", ""),
+                            "anchor_chunk_id": anchor.get("chunk_id", anchor.get("id", "")),
+                            "anchor_chunk_ids": sorted(anchor_chunk_ids),
+                            "is_anchor": is_anchor,
+                            "read_mode": "full_small_doc",
+                        })
 
-                        def _anchor_distance(a: dict[str, Any]) -> int:
-                            try:
-                                return abs(int(a.get("chunk_index", 0) or 0) - chunk_index)
-                            except (TypeError, ValueError):
-                                return 0
+            # -- Execute dynamic expansion reads via get_chunks_around_index --
+            if expand_specs and pg is not None:
+                # Deduplicate by (knowledge_id, center_index)
+                seen_expand: set[tuple[str, int]] = set()
+                deduped_expand: list[dict[str, Any]] = []
+                for spec in expand_specs:
+                    key = (spec["knowledge_id"], spec["center_index"])
+                    if key in seen_expand:
+                        continue
+                    seen_expand.add(key)
+                    deduped_expand.append(spec)
 
-                        matched_anchor = min(anchors, key=_anchor_distance)
-                    matched_anchor = matched_anchor or anchor
-                    matched_anchor_id = matched_anchor.get(
-                        "chunk_id", matched_anchor.get("id", "")
+                expand_tasks = [
+                    (
+                        spec,
+                        pg.get_chunks_around_index(
+                            spec["knowledge_id"],
+                            spec["center_index"],
+                            radius=expand_max_chunks // 2,
+                        ),
                     )
-                    evidence.append({
-                        "knowledge_id": evidence_kid,
-                        "knowledge_title": title,
-                        "chunk_id": chunk_id,
-                        "chunk_index": chunk.get("chunk_index", 0),
-                        "content": content,
-                        "score": matched_anchor.get("score", 0.0) if is_anchor else 0.0,
-                        "anchor_score": matched_anchor.get("score", 0.0),
-                        "source_query": matched_anchor.get("source_query", ""),
-                        "anchor_chunk_id": chunk_id if is_anchor else matched_anchor_id,
-                        "anchor_chunk_ids": sorted(anchor_chunk_ids),
-                        "is_anchor": is_anchor,
-                        "read_mode": spec.get("mode", ""),
-                    })
+                    for spec in deduped_expand
+                ]
+                expand_results = await asyncio.gather(
+                    *(task for _spec, task in expand_tasks),
+                    return_exceptions=True,
+                )
+                seen_expand_chunks: set[str] = set()
+                for (spec, _task), result in zip(expand_tasks, expand_results):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "[RAG WF] expand read %s idx=%s failed: %s",
+                            spec.get("knowledge_id", ""),
+                            spec.get("center_index", ""),
+                            result,
+                        )
+                        continue
+                    anchor = spec["anchor"]
+                    anchor_chunk_id = anchor.get("chunk_id", anchor.get("id", ""))
+                    center_idx = spec["center_index"]
+                    title = anchor.get("knowledge_title", "")
+
+                    # Sort neighbors by distance from center (anchor first)
+                    neighbor_chunks: list[Any] = sorted(
+                        result, key=lambda c: abs(c.chunk_index - center_idx)
+                    )
+
+                    # Walk outward, accumulate up to expand_max_len chars / expand_max_chunks
+                    accumulated_len = 0
+                    collected_count = 0
+                    for chunk in neighbor_chunks:
+                        chunk_id = chunk.id
+                        content = (chunk.content or "").strip()
+                        if not chunk_id or chunk_id in seen_expand_chunks or not content:
+                            continue
+                        if collected_count >= expand_max_chunks:
+                            break
+                        if accumulated_len >= expand_max_len:
+                            break
+                        seen_expand_chunks.add(chunk_id)
+                        accumulated_len += len(content)
+                        collected_count += 1
+                        is_anchor_chunk = (chunk_id == anchor_chunk_id)
+                        evidence.append({
+                            "knowledge_id": spec["knowledge_id"],
+                            "knowledge_title": title,
+                            "chunk_id": chunk_id,
+                            "chunk_index": chunk.chunk_index,
+                            "content": content,
+                            "score": anchor.get("score", 0.0) if is_anchor_chunk else 0.0,
+                            "anchor_score": anchor.get("score", 0.0),
+                            "source_query": anchor.get("source_query", ""),
+                            "anchor_chunk_id": anchor_chunk_id,
+                            "anchor_chunk_ids": sorted(spec.get("anchor_chunk_ids") or set()),
+                            "is_anchor": is_anchor_chunk,
+                            "read_mode": "expand_context",
+                        })
 
             logger.info(
-                "[RAG WF] deep read DIAG: docs=%d counts=%d specs=%d evidence=%d small_limit=%d window=%d",
+                "[RAG WF] deep read DIAG: docs=%d counts=%d small_specs=%d expand_specs=%d evidence=%d "
+                "expand_min_len=%d expand_max_len=%d expand_max_chunks=%d",
                 len(doc_ids),
                 len(doc_counts),
-                len(deduped_specs),
+                len(deduped_small) if deduped_small else 0,
+                len(deduped_expand) if expand_specs and pg else 0,
                 len(evidence),
-                small_doc_limit,
-                window,
+                expand_min_len,
+                expand_max_len,
+                expand_max_chunks,
             )
 
         # Fallback: if deep-read is unavailable/empty, use reranked hit chunks.

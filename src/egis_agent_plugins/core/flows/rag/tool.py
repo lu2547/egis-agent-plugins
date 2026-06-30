@@ -5,6 +5,22 @@ LLM 不感知阶段边界，一次调用拿到 evidence pack。
 
 继承 ``AgentTool``（非 ``WorkflowTool``），因为 ``WorkflowTool`` 会
 把每个 transition action 暴露给 LLM，而我们希望 LLM 只看到一次 ``run``。
+
+1、	start阶段: 闲聊跳出
+2、rewrite:	查询改写（代词消解、子问题拆分）
+3、route: web / internal / web_unavailable
+recall 阶段:
+  → _milvus_search_with_embedding(top_k=10)
+    → search_across_collections(top_k=10*2=20)
+      → 每个 collection: hybrid_search(top_k=20)
+        → 向量请求 limit=20*2=40
+        → BM25 请求 limit=20*2=40
+        → RRF 融合返回 limit=20
+      → 跨集合 RRF 返回 top_k=20
+rank 阶段:
+  → 取前 30 条送 rerank → MMR 返回 10 条
+evidence 阶段:
+  → 取前 10 条做深度阅读（关联读）chunk < 350 字符、上限1000字符
 """
 
 from __future__ import annotations

@@ -342,6 +342,51 @@ class PostgresClient:
 
             return chunks, total
 
+    async def get_chunks_around_index(
+        self,
+        knowledge_id: str,
+        center_index: int,
+        radius: int = 5,
+    ) -> list["Chunk"]:
+        """获取 center_index 前后 radius 范围内的 chunks，按 chunk_index 排序。"""
+        start_idx = max(0, center_index - radius)
+        end_idx = center_index + radius
+        async with self._get_pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id_chunk AS id, content, chunk_index,
+                       id_knowledge AS knowledge_id, id_knowledge_base AS knowledge_base_id,
+                       chunk_type, is_enabled, start_at, end_at, parent_chunk_id,
+                       image_info, tag_id, created_at
+                FROM chunk
+                WHERE id_knowledge = $1
+                      AND chunk_index BETWEEN $2 AND $3
+                      AND is_enabled = true
+                      AND deleted_at IS NULL
+                ORDER BY chunk_index ASC
+                """,
+                knowledge_id, start_idx, end_idx,
+            )
+            return [
+                Chunk(
+                    id=row["id"],
+                    content=row["content"] or "",
+                    chunk_index=row["chunk_index"],
+                    knowledge_id=row["knowledge_id"],
+                    knowledge_base_id=row["knowledge_base_id"],
+                    chunk_type=row["chunk_type"],
+                    source_type=0,
+                    is_enabled=row["is_enabled"],
+                    start_at=row["start_at"] or 0,
+                    end_at=row["end_at"] or 0,
+                    parent_chunk_id=row["parent_chunk_id"] or "",
+                    image_info=row["image_info"] or "",
+                    tag_id=row["tag_id"] or "",
+                    created_at=str(row["created_at"]) if row["created_at"] else "",
+                )
+                for row in rows
+            ]
+
     async def search_chunks_by_keywords(
         self,
         patterns: list[str],
