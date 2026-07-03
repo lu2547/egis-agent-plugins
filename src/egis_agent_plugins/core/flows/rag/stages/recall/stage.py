@@ -16,7 +16,6 @@ from egis_agent_plugins.core.flows.rag.clients import RAGClients
 from egis_agent_plugins.core.flows.rag._services.scope_adapter import (
     RecallScope,
     scope_plan_from_filters_or_context,
-    scopes_from_flat_filters,
 )
 from egis_agent_plugins.core.service.base import RetrieverType
 from egis_agent_plugins.core.flows.rag.stages.recall.collections import (
@@ -27,7 +26,6 @@ from egis_agent_plugins.core.flows.rag.filters import (
     ResolvedFilters,
     resolve_filters,
 )
-from egis_agent_plugins.core.flows.rag.state import read_forced_filters
 logger = logging.getLogger(__name__)
 
 
@@ -185,7 +183,7 @@ async def _resolve_collection_groups(
 
     if missing_collection:
         logger.warning(
-            "[KnowledgeSearch] selected docs have no collection_name; fallback to KB route: %s",
+            "[KnowledgeSearch] selected docs have no collection_name; using scope collection routing: %s",
             missing_collection[:5],
         )
     return None
@@ -201,39 +199,15 @@ def _milvus_search_with_embedding(
     filter_expr: str | None = None,
     top_k: int,
 ) -> list[SearchResult]:
-    """同步 Milvus 检索（hybrid 优先，失败回退 vector）。"""
+    """同步 Milvus hybrid 检索。"""
     try:
         kb_meta_groups = collection_groups or _build_kb_meta_groups(clients, resolved)
-
-        try:
-            search_results = clients.milvus.search_across_collections(
-                kb_meta_groups=kb_meta_groups,
-                query_embedding=query_embedding,
-                query_text=query,
-                retriever_type=RetrieverType.HYBRID,
-                knowledge_ids=resolved.knowledge_ids or None,
-                tag_ids=resolved.tag_ids or None,
-                filter_expr=filter_expr,
-                top_k=top_k * 2,
-            )
-            return [
-                SearchResult(
-                    id=r.id, content=r.content, chunk_id=r.chunk_id,
-                    knowledge_id=r.knowledge_id, knowledge_base_id=r.knowledge_base_id,
-                    score=r.score, source_query=query, query_type="hybrid",
-                )
-                for r in search_results
-            ]
-        except Exception as e:
-            logger.warning(
-                "[KnowledgeSearch] Hybrid search failed for query '%s': %s, falling back to vector-only",
-                query, e,
-            )
 
         search_results = clients.milvus.search_across_collections(
             kb_meta_groups=kb_meta_groups,
             query_embedding=query_embedding,
-            retriever_type=RetrieverType.VECTOR,
+            query_text=query,
+            retriever_type=RetrieverType.HYBRID,
             knowledge_ids=resolved.knowledge_ids or None,
             tag_ids=resolved.tag_ids or None,
             filter_expr=filter_expr,
@@ -243,7 +217,7 @@ def _milvus_search_with_embedding(
             SearchResult(
                 id=r.id, content=r.content, chunk_id=r.chunk_id,
                 knowledge_id=r.knowledge_id, knowledge_base_id=r.knowledge_base_id,
-                score=r.score, source_query=query, query_type="vector",
+                score=r.score, source_query=query, query_type="hybrid",
             )
             for r in search_results
         ]
@@ -381,25 +355,19 @@ async def run(
     top_k: int = 10,
 ) -> dict[str, Any]:
     """Knowledge-search 业务核心。返回 dict 含 ``results`` / ``count`` / ``summary`` 等字段。"""
-    forced_kbs, forced_tags, forced_files = read_forced_filters(ctx)
     queries = args.get("queries", [])
 
     scope_plan = scope_plan_from_filters_or_context(args, ctx)
     scoped_kb_ids = scope_plan.flat_kb_ids() if scope_plan.has_scopes else []
+    selected_documents = args.get("selected_documents") or []
+    selected_knowledge_ids = _ensure_str_list(args.get("knowledge_ids") or None) or [
+        str(doc.get("knowledge_id", "")).strip()
+        for doc in selected_documents
+        if str(doc.get("knowledge_id", "")).strip()
+    ]
 
-    kb_ids_raw = (
-        scoped_kb_ids
-        or (forced_kbs if forced_kbs is not None else None)
-        or args.get("knowledge_base_ids")
-        or clients.default_kb_ids
-    )
+    kb_ids_raw = scoped_kb_ids or clients.default_kb_ids
     kb_ids_in = _ensure_str_list(kb_ids_raw) or kb_ids_raw
-    kb_names = None if forced_kbs is not None else (args.get("kb_names") or None)
-    knowledge_ids_in = _ensure_str_list(forced_files if forced_files is not None else (args.get("knowledge_ids") or None))
-    file_names = None if forced_files is not None else (args.get("file_names") or None)
-    tag_ids_raw = forced_tags if forced_tags is not None else (args.get("tag_ids") or None)
-    tag_ids_in = _ensure_str_list(tag_ids_raw) or tag_ids_raw
-    tag_names = None if forced_tags is not None else (args.get("tag_names") or None)
 
     if not queries:
         return {"error": "queries 参数不能为空"}
@@ -413,19 +381,11 @@ async def run(
         resolved = await resolve_filters(
             clients.postgres,
             kb_ids=kb_ids_in,
-            kb_names=kb_names,
-            tag_ids=tag_ids_in,
-            tag_names=tag_names,
-            knowledge_ids=knowledge_ids_in,
-            file_names=file_names,
+            knowledge_ids=selected_knowledge_ids,
         )
     except Exception as e:
-        logger.warning("[KnowledgeSearch] resolve_filters failed: %s, fallback to raw ids", e)
-        resolved = ResolvedFilters(
-            kb_ids=list(kb_ids_in or []),
-            tag_ids=list(tag_ids_in or []),
-            knowledge_ids=list(knowledge_ids_in or []),
-        )
+        logger.error("[KnowledgeSearch] resolve_filters failed: %s", e)
+        return {"error": f"过滤条件解析失败: {e}"}
     logger.info("[KS] stage=resolve_filters cost_ms=%d", int((time.perf_counter() - _t_resolve) * 1000))
 
     logger.info(
@@ -439,36 +399,23 @@ async def run(
             return {"error": "queries 全为空"}
         recall_queries = effective_queries[:1] if scope_plan.has_scopes else effective_queries
 
-        # 批量 embedding
         _t_embed = time.perf_counter()
         try:
             embeddings = await clients.embedding.embed_queries(recall_queries)
         except Exception as e:
-            logger.warning("[KnowledgeSearch] embed_queries 失败，回退单条: %s", e)
-            embeddings = await asyncio.gather(
-                *[clients.embedding.embed_query(q) for q in recall_queries]
-            )
+            logger.error("[KnowledgeSearch] embed_queries failed: %s", e)
+            return {"error": f"embedding 失败: {e}"}
         logger.info("[KS] stage=embed cost_ms=%d", int((time.perf_counter() - _t_embed) * 1000))
 
-        scopes = (
-            scope_plan.scopes
-            if scope_plan.has_scopes
-            else scopes_from_flat_filters(
-                kb_ids=resolved.kb_ids,
-                tag_ids=resolved.tag_ids,
-                knowledge_ids=resolved.knowledge_ids,
-            )
-        )
+        scopes = scope_plan.scopes if scope_plan.has_scopes else [RecallScope()]
         if not scopes:
             scopes = [RecallScope()]
 
-        selected_documents = args.get("selected_documents") or []
         scopes = [
             _scope_with_selected_documents(scope, selected_documents)
             for scope in scopes
         ]
-
-        fallback_collection_groups = await _resolve_collection_groups(clients, resolved)
+        selected_collection_groups = await _resolve_collection_groups(clients, resolved)
 
         # 多 query 并发 Milvus 检索
         _t_milvus = time.perf_counter()
@@ -476,7 +423,7 @@ async def run(
 
         async def _search_scope_query(scope: RecallScope, q: str, emb: list[float]) -> list[SearchResult]:
             scope_groups = _collection_groups_for_scope(clients, resolved, scope)
-            collection_groups = scope_groups or fallback_collection_groups
+            collection_groups = scope_groups or selected_collection_groups
             filter_expr = scope.to_filter_expr(include_enabled=True)
             scope_resolved = ResolvedFilters(
                 kb_ids=[scope.kb_id] if scope.kb_id else resolved.kb_ids,

@@ -25,6 +25,10 @@ from pymilvus import (
     MilvusException,
     RRFRanker,
 )
+try:
+    from pymilvus import WeightedRanker
+except ImportError:  # pragma: no cover - depends on pymilvus version
+    WeightedRanker = None  # type: ignore[assignment]
 
 from egis_agent_plugins.core.internal.rag_config import RAGConfig
 
@@ -211,6 +215,8 @@ class MilvusClient:
         filter_expr: str | None = None,
         anns_field: str | None = None,
         output_fields: list[str] | None = None,
+        vector_weight: float = 0.7,
+        keywords_weight: float = 0.3,
     ) -> list[MilvusSearchResult]:
         """执行搜索（统一入口）
 
@@ -221,6 +227,8 @@ class MilvusClient:
             filter_expr: 可选，外部传入的过滤表达式，优先级高于内部构建。
             anns_field: 可选，向量字段名（默认 'embedding'）。
             output_fields: 可选，输出字段列表（默认 OUTPUT_FIELDS）。
+            vector_weight: 混合检索中的向量权重，默认 0.7。
+            keywords_weight: 混合检索中的 BM25 权重，默认 0.3。
         """
         if isinstance(retriever_type, str):
             retriever_type = RetrieverType(retriever_type)
@@ -265,6 +273,7 @@ class MilvusClient:
                 query_text=query_text,
                 filter_expr=filter_expr,
                 top_k=top_k,
+                output_fields=output_fields,
             )
 
         elif retriever_type == RetrieverType.HYBRID:
@@ -278,6 +287,9 @@ class MilvusClient:
                 query_text=query_text,
                 filter_expr=filter_expr,
                 top_k=top_k,
+                vector_weight=vector_weight,
+                keywords_weight=keywords_weight,
+                output_fields=output_fields,
             )
 
         else:
@@ -321,6 +333,7 @@ class MilvusClient:
         query_text: str,
         filter_expr: str | None,
         top_k: int,
+        output_fields: list[str] | None = None,
     ) -> list[MilvusSearchResult]:
         """BM25 关键词检索
 
@@ -337,7 +350,7 @@ class MilvusClient:
                 data=[query_text],
                 anns_field=self.FIELD_CONTENT_SPARSE,
                 limit=top_k,
-                output_fields=self.OUTPUT_FIELDS,
+                output_fields=output_fields or self.OUTPUT_FIELDS,
                 search_params=search_params,
                 filter=filter_expr,
             )
@@ -429,8 +442,9 @@ class MilvusClient:
         collection_name: str | None = None,
         vector_weight: float = 0.7,
         keywords_weight: float = 0.3,
+        output_fields: list[str] | None = None,
     ) -> list[MilvusSearchResult]:
-        """混合检索（向量 + BM25，RRF 融合）
+        """混合检索（向量 + BM25，加权融合）
 
         Args:
             collection_name: 可选，显式指定 collection（跨三级库路由场景下使用）。
@@ -455,6 +469,7 @@ class MilvusClient:
             top_k=top_k,
             vector_weight=vector_weight,
             keywords_weight=keywords_weight,
+            output_fields=output_fields,
         )
 
     def _hybrid_search_on_collection(
@@ -467,15 +482,16 @@ class MilvusClient:
         top_k: int,
         vector_weight: float = 0.7,
         keywords_weight: float = 0.3,
+        output_fields: list[str] | None = None,
     ) -> list[MilvusSearchResult]:
         """在指定 collection 上执行混合检索（Milvus 原生 hybrid_search）。
 
         使用 Milvus 2.4+ 原生 ``hybrid_search``：向量 + BM25 两路
-        ``AnnSearchRequest`` 一次 RPC 在服务端完成检索与 RRF 融合，
+        ``AnnSearchRequest`` 一次 RPC 在服务端完成检索与加权融合，
         避免客户端两次往返再手写融合。
 
-        ``vector_weight`` / ``keywords_weight`` 为历史签名兼容保留；
-        原生 ``RRFRanker(60)`` 为纯 rank 融合（k=60，对齐原 rrf_k），不消费权重。
+        默认内容检索使用向量 0.7 / BM25 0.3；调用方可以覆盖权重，
+        例如文档选择更偏关键词时使用向量 0.3 / BM25 0.7。
         """
         self.ensure_collection_loaded(collection_name)
 
@@ -499,12 +515,22 @@ class MilvusClient:
                 expr=filter_expr,
             )
 
+            ranker = (
+                WeightedRanker(vector_weight, keywords_weight)
+                if WeightedRanker is not None
+                else RRFRanker(60)
+            )
+            if WeightedRanker is None:
+                logger.warning(
+                    "[Milvus] WeightedRanker unavailable; fallback to RRFRanker(60)"
+                )
+
             res = self.client.hybrid_search(
                 collection_name=collection_name,
                 reqs=[vector_req, keywords_req],
-                ranker=RRFRanker(60),
+                ranker=ranker,
                 limit=top_k,
-                output_fields=self.OUTPUT_FIELDS,
+                output_fields=output_fields or self.OUTPUT_FIELDS,
             )
 
             return self._parse_search_results(res)
@@ -525,6 +551,8 @@ class MilvusClient:
         tag_ids: list[str] | None = None,
         filter_expr: str | None = None,
         top_k: int = 10,
+        vector_weight: float = 0.7,
+        keywords_weight: float = 0.3,
     ) -> list[MilvusSearchResult]:
         """跨多 collection 检索 + RRF 聚合
 
@@ -547,6 +575,8 @@ class MilvusClient:
             filter_expr: 完整 Milvus 过滤表达式。提供时优先使用，用于
                 ``kb AND (tag OR file)`` 这类结构化前端范围。
             top_k: 最终返回条数。
+            vector_weight: 混合检索中的向量权重。
+            keywords_weight: 混合检索中的 BM25 权重。
 
         Returns:
             按 RRF 分数降序排列的 ``MilvusSearchResult`` 列表，长度 ≤ ``top_k``。
@@ -565,6 +595,8 @@ class MilvusClient:
                 tag_ids=tag_ids,
                 filter_expr=filter_expr,
                 top_k=top_k,
+                vector_weight=vector_weight,
+                keywords_weight=keywords_weight,
             )
 
         per_collection_topk = max(top_k * 2, top_k)
@@ -589,6 +621,8 @@ class MilvusClient:
                 filter_expr=filter_expr,
                 top_k=per_collection_topk,
                 collection_name=collection_name,
+                vector_weight=vector_weight,
+                keywords_weight=keywords_weight,
             )
 
         max_workers = max(

@@ -2,10 +2,10 @@
 
 设计取舍：
 - 合并 ``BaseReranker`` / ``DashScopeReranker`` / ``RerankService`` 三类为单一 ``Rerank`` 类
-- 删除 ``LLMReranker`` 及多级降级链（违背「必须用配置的 rerank 模型」的技术策略）
+- 删除 ``LLMReranker`` 及多级兜底链（违背「必须用配置的 rerank 模型」的技术策略）
 - 失败策略：HTTP 调用失败 → raise ``RerankError``（不静默吞错、不返原序兜底）
-- 阈值过滤 + top1 safety net 保留（业务侧常见需求）
-- 凭证任一缺失（``RERANK_BASE_URL`` / ``RERANK_API_KEY`` / ``RERANK_MODEL``）时返原序，非失败降级
+- 阈值过滤：低于 ``RAG_RERANK_THRESHOLD`` 的结果不允许进入后续读取
+- 凭证任一缺失（``RERANK_BASE_URL`` / ``RERANK_API_KEY`` / ``RERANK_MODEL``）时按未启用 rerank 处理
 
 双 provider：
 - ``openai``: Bearer 鉴权（``Authorization: Bearer {api_key}``）
@@ -70,7 +70,6 @@ class Rerank:
             results = await rerank.rerank(query, passages, top_k=10)
     """
 
-    _SAFETY_NET_MIN_SCORE = 0.15
     _DEFAULT_TIMEOUT = 30.0
 
     def __init__(self, config: RAGConfig) -> None:
@@ -103,7 +102,7 @@ class Rerank:
 
         - 未启用 → 返原序（score=1.0，让上层下游逻辑无感切换）
         - 启用但空输入 → 返 ``[]``
-        - 启用且调用成功 → 阈值过滤 + top1 safety net 后返回
+        - 启用且调用成功 → 阈值过滤后返回
         - 启用但调用失败 → raise ``RerankError``
         """
         if not self.enabled:
@@ -154,17 +153,7 @@ class Rerank:
             f"input={len(doc_texts)} → output={len(results)}"
         )
 
-        filtered = self._apply_threshold(results)
-
-        # safety net: 阈值过滤全部淘汰时，保留 score 足够高的 top1
-        if not filtered and results and results[0].score >= self._SAFETY_NET_MIN_SCORE:
-            logger.info(
-                f"[Rerank] All below threshold ({self._config.rerank_threshold}), "
-                f"keeping top1 (score={results[0].score:.4f})"
-            )
-            filtered = [results[0]]
-
-        return filtered
+        return self._apply_threshold(results)
 
     # ── 内部实现 ──
 

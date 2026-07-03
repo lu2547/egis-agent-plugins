@@ -48,18 +48,38 @@ async def _apply_rerank(
         logger.warning("[Rank] rerank failed: %s; keep recall order", e)
         return candidates
 
+    accepted: list[dict[str, Any]] = []
+    accepted_indices: set[int] = set()
     for rr in rerank_results:
         if 0 <= rr.index < len(head):
-            head[rr.index]["score"] = rr.score
+            item = head[rr.index]
+            item["score"] = rr.score
+            item["rerank_score"] = rr.score
+            item["reranked"] = True
+            accepted.append(item)
+            accepted_indices.add(rr.index)
 
-    return head + tail
-
-
-def _apply_threshold(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    threshold = float(os.getenv("RAG_RERANK_THRESHOLD", "0.0"))
-    if threshold <= 0:
-        return candidates
-    return [c for c in candidates if float(c.get("score", 0.0)) >= threshold]
+    logger.info(
+        "[Rank] rerank accepted=%d dropped=%d tail_dropped=%d",
+        len(accepted),
+        len(head) - len(accepted),
+        len(tail),
+    )
+    for item in accepted:
+        logger.info(
+            "[Rank] ✔ %s  score=%.4f  knowledge_id=%s",
+            item.get("file_name", "unknown"),
+            item.get("rerank_score", 0.0),
+            item.get("knowledge_id", ""),
+        )
+    for i, item in enumerate(head):
+        if i not in accepted_indices:
+            logger.info(
+                "[Rank] ✘ %s  (dropped by rerank/threshold)  knowledge_id=%s",
+                item.get("file_name", "unknown"),
+                item.get("knowledge_id", ""),
+            )
+    return accepted
 
 
 def _apply_diversity(candidates: list[dict[str, Any]], *, top_k: int) -> list[dict[str, Any]]:
@@ -92,14 +112,13 @@ async def run(
 
     reranked = await _apply_rerank(clients, queries=queries, candidates=candidates)
     reranked.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
-    filtered = _apply_threshold(reranked)
-    ranked = _apply_diversity(filtered, top_k=top_k)
+    ranked = _apply_diversity(reranked, top_k=top_k)
 
     elapsed = int((time.perf_counter() - t0) * 1000)
     logger.info(
-        "[Rank] candidates=%d filtered=%d ranked=%d cost_ms=%d",
+        "[Rank] candidates=%d accepted=%d ranked=%d cost_ms=%d",
         len(candidates),
-        len(filtered),
+        len(reranked),
         len(ranked),
         elapsed,
     )

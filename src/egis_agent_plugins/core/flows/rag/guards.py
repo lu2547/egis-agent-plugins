@@ -26,6 +26,12 @@ _CHITCHAT_KEYWORDS = frozenset({
 })
 
 
+def is_obvious_no_retrieval_query(query: str) -> bool:
+    """Fast local check for pure short greetings / acknowledgements."""
+    query = (query or "").strip().lower()
+    return bool(query and len(query) <= 15 and query in _CHITCHAT_KEYWORDS)
+
+
 def _is_obvious_no_retrieval(ictx: InstanceCtx) -> None:
     """判断用户问题是否无需检索（纯闲聊/问候）。
 
@@ -37,7 +43,7 @@ def _is_obvious_no_retrieval(ictx: InstanceCtx) -> None:
     query = (ictx.args.get("query") or "").strip().lower()
     if not query:
         return  # 空 query 不拦截，让 effect 去处理
-    if len(query) <= 15 and query in _CHITCHAT_KEYWORDS:
+    if is_obvious_no_retrieval_query(query):
         return
     raise WorkflowRejection(
         code="guard",
@@ -46,6 +52,18 @@ def _is_obvious_no_retrieval(ictx: InstanceCtx) -> None:
 
 
 # ── Route 三分支 Guards ─────────────────────────────────────────────────
+
+def _route_no_retrieval(ictx: InstanceCtx) -> None:
+    """rewrite/router classified the turn as direct/no retrieval."""
+    if ictx.probing:
+        return
+    rewrite = ictx.instance_data.get("rewrite") or {}
+    if rewrite.get("intent") == "direct":
+        return
+    raise WorkflowRejection(
+        code="guard",
+        message="not direct",
+    )
 
 def _web_requested_but_disabled(ictx: InstanceCtx) -> None:
     """intent=web_search 且 web 搜索服务未配置。"""
@@ -93,12 +111,17 @@ def _route_web(ictx: InstanceCtx) -> None:
         )
 
 
-def _route_internal(ictx: InstanceCtx) -> None:
-    """默认兜底路由 — 无 guard，始终放行。
-
-    作为 ``route`` 的最后一条 Transition，保证至少有一条能通过。
-    """
-    # 无 guard — 永远放行
+def _route_rag(ictx: InstanceCtx) -> None:
+    """RAG route: select documents, recall chunks, then read by doc size."""
+    if ictx.probing:
+        return
+    rewrite = ictx.instance_data.get("rewrite") or {}
+    intent = rewrite.get("intent", "")
+    source = ictx.instance_data.get("source", "auto")
+    if source == "web":
+        raise WorkflowRejection(code="guard", message="web source")
+    if intent == "direct":
+        raise WorkflowRejection(code="guard", message="direct route")
     return None
 
 

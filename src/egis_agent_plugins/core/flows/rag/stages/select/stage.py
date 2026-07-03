@@ -15,13 +15,12 @@ from egis_agent_plugins.core.flows.rag.clients import RAGClients
 from egis_agent_plugins.core.flows.rag._services.scope_adapter import (
     RecallScope,
     scope_plan_from_filters_or_context,
-    scopes_from_flat_filters,
 )
 from egis_agent_plugins.core.flows.rag.filters import (
     ResolvedFilters,
     resolve_filters,
 )
-from egis_agent_plugins.core.flows.rag.state import read_forced_filters
+from egis_agent_plugins.core.service.base import MilvusSearchResult, RetrieverType
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 SUMMARY_ANNS_FIELD = "embedding"
-SUMMARY_OUTPUT_FIELDS = ["knowledge_id", "knowledge_base_id"]
+SUMMARY_OUTPUT_FIELDS = ["knowledge_id", "knowledge_base_id", "content", "file_name"]
 
 
 def _ensure_str_list(v) -> list[str] | None:
@@ -123,15 +122,45 @@ def _parse_summary_results(raw_results) -> list[dict]:
         documents.append({
             "knowledge_id": knowledge_id,
             "knowledge_base_id": ent.get("knowledge_base_id", ""),
+            "content": ent.get("content", ""),
+            "file_name": ent.get("file_name", ""),
             "score": float(distance) if distance else 0.0,
         })
     return documents
 
 
-def _format_output(documents: list[dict], query: str) -> str:
+def _documents_from_search_results(results: list[MilvusSearchResult]) -> list[dict]:
+    """将 MilvusClient 搜索结果转换成文档摘要候选。"""
+    documents: list[dict] = []
+    for item in results:
+        if not item.knowledge_id:
+            continue
+        documents.append({
+            "knowledge_id": item.knowledge_id,
+            "knowledge_base_id": item.knowledge_base_id,
+            "content": item.content,
+            "file_name": item.file_name,
+            "score": float(item.score or 0.0),
+        })
+    return documents
+
+
+def _format_output(
+    documents: list[dict],
+    query: str,
+    strategy: dict[str, Any],
+) -> str:
+    weights = strategy.get("weights") if isinstance(strategy, dict) else {}
+    preference = strategy.get("document_match_preference", "") if isinstance(strategy, dict) else ""
     lines = [
         "=== 文档选择结果 ===",
         f"查询: {query}",
+        (
+            "文档匹配权重: "
+            f"preference={preference}, "
+            f"filename={float((weights or {}).get('filename', 0.0)):.2f}, "
+            f"summary={float((weights or {}).get('summary', 0.0)):.2f}"
+        ),
         f"找到 {len(documents)} 个候选文档：",
         "",
     ]
@@ -139,7 +168,12 @@ def _format_output(documents: list[dict], query: str) -> str:
         kid = doc.get("knowledge_id", "")
         kb_id = doc.get("knowledge_base_id", "")
         score = doc.get("score", 0.0)
-        lines.append(f"{i}. knowledge_id={kid} kb={kb_id} (相关度: {score:.3f})")
+        match_scores = doc.get("document_match_scores") or {}
+        lines.append(
+            f"{i}. knowledge_id={kid} kb={kb_id} "
+            f"(final={score:.3f}, filename={float(match_scores.get('filename', 0.0)):.3f}, "
+            f"summary={float(match_scores.get('summary', 0.0)):.3f})"
+        )
     lines.append("")
     lines.append("提示: 使用上述 knowledge_ids 调用 knowledge_search 做内容检索")
     return "\n".join(lines)
@@ -157,6 +191,180 @@ def _dedup_documents(documents: list[dict]) -> list[dict]:
     return out
 
 
+def _filename_score(query: str, doc: dict) -> float:
+    target = " ".join(
+        str(doc.get(key) or "")
+        for key in ("file_name", "knowledge_title")
+    ).lower()
+    q = (query or "").lower()
+    if not q or not target:
+        return 0.0
+    if target and target in q:
+        return 1.0
+    query_terms = {part for part in q.replace("《", " ").replace("》", " ").replace(".", " ").split() if part}
+    if not query_terms:
+        return 0.0
+    hits = sum(1 for term in query_terms if term and term in target)
+    return min(1.0, hits / max(1, len(query_terms)))
+
+
+def _document_match_strategy(hints: dict[str, Any]) -> dict[str, Any]:
+    """Resolve filename/summary fusion weights strictly from model hints."""
+    preference = str(hints.get("document_match_preference") or "summary").strip()
+    if preference == "filename":
+        filename_weight, summary_weight = 0.75, 0.25
+    elif preference == "balanced":
+        filename_weight, summary_weight = 0.5, 0.5
+    else:
+        preference = "summary"
+        filename_weight, summary_weight = 0.25, 0.75
+    return {
+        "document_match_preference": preference,
+        "weights": {
+            "filename": filename_weight,
+            "summary": summary_weight,
+        },
+        "reason": str(hints.get("reason") or "").strip(),
+    }
+
+
+def _weights_from_strategy(strategy: dict[str, Any]) -> tuple[float, float]:
+    weights = strategy.get("weights") if isinstance(strategy, dict) else {}
+    if not isinstance(weights, dict):
+        weights = {}
+    return (
+        float(weights.get("filename", 0.25) or 0.25),
+        float(weights.get("summary", 0.75) or 0.75),
+    )
+
+
+def _apply_document_strategy(
+    *,
+    query: str,
+    documents: list[dict],
+    hints: dict[str, Any],
+) -> list[dict]:
+    if not documents:
+        return documents
+    strategy = _document_match_strategy(hints)
+    filename_weight, summary_weight = _weights_from_strategy(strategy)
+    max_summary = max(float(doc.get("score", 0.0) or 0.0) for doc in documents) or 1.0
+    for doc in documents:
+        summary_score = float(doc.get("score", 0.0) or 0.0) / max_summary
+        name_score = _filename_score(query, doc)
+        final_score = filename_weight * name_score + summary_weight * summary_score
+        doc["filename_score"] = name_score
+        doc["summary_score"] = summary_score
+        doc["score"] = final_score
+        doc["document_match_strategy"] = strategy
+        doc["document_match_scores"] = {
+            "filename": name_score,
+            "summary": summary_score,
+            "final": final_score,
+        }
+    return sorted(documents, key=lambda d: float(d.get("score", 0.0)), reverse=True)
+
+
+def _shortlist_documents(
+    documents: list[dict],
+) -> tuple[list[dict], list[dict], dict[str, Any]]:
+    """Keep only documents that passed document selection before chunk recall."""
+    if not documents:
+        return [], [], {
+            "max_documents": 0,
+            "min_score": 0.0,
+            "relative_to_best": 0.0,
+            "best_score": 0.0,
+        }
+
+    max_documents = max(1, int(os.getenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "6")))
+    min_score = float(os.getenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0.15"))
+    relative_to_best = float(os.getenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.55"))
+    best_score = max(float(doc.get("score", 0.0) or 0.0) for doc in documents)
+    cutoff = max(min_score, best_score * relative_to_best)
+
+    selected = [
+        doc for doc in documents
+        if float(doc.get("score", 0.0) or 0.0) >= cutoff
+    ][:max_documents]
+    rejected = [doc for doc in documents if doc not in selected]
+    thresholds = {
+        "max_documents": max_documents,
+        "min_score": min_score,
+        "relative_to_best": relative_to_best,
+        "best_score": best_score,
+        "cutoff": cutoff,
+    }
+    return selected, rejected, thresholds
+
+
+def _excluded_file_names(hints: dict[str, Any]) -> list[str]:
+    raw = hints.get("excluded_file_names") or hints.get("exclude_file_names") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [
+        str(item).strip().casefold()
+        for item in raw
+        if str(item).strip()
+    ]
+
+
+def _apply_excluded_files(
+    documents: list[dict],
+    hints: dict[str, Any],
+) -> tuple[list[dict], list[dict]]:
+    excluded_names = _excluded_file_names(hints)
+    if not excluded_names:
+        return documents, []
+
+    kept: list[dict] = []
+    excluded: list[dict] = []
+    for doc in documents:
+        title = str(doc.get("knowledge_title") or "").casefold()
+        file_name = str(doc.get("file_name") or "").casefold()
+        haystack = f"{title} {file_name}"
+        if any(name and name in haystack for name in excluded_names):
+            doc["excluded_by_hint"] = True
+            excluded.append(doc)
+            continue
+        kept.append(doc)
+    return kept, excluded
+
+
+def _doc_log_item(doc: dict[str, Any]) -> dict[str, Any]:
+    scores = doc.get("document_match_scores") or {}
+    return {
+        "title": doc.get("knowledge_title") or doc.get("file_name") or doc.get("knowledge_id"),
+        "kid": doc.get("knowledge_id", ""),
+        "score": round(float(doc.get("score", 0.0) or 0.0), 4),
+        "filename": round(float(scores.get("filename", 0.0) or 0.0), 4),
+        "summary": round(float(scores.get("summary", 0.0) or 0.0), 4),
+    }
+
+
+async def _fill_document_titles(clients: RAGClients, documents: list[dict]) -> None:
+    """Fill document titles from PostgreSQL for display and downstream ranking."""
+    knowledge_ids = list({doc.get("knowledge_id", "") for doc in documents if doc.get("knowledge_id")})
+    if not knowledge_ids:
+        return
+    try:
+        await clients.postgres.connect()
+        knowledges = await clients.postgres.get_knowledges_by_ids(knowledge_ids)
+    except Exception as e:
+        logger.warning("[SelectDocuments] fill document titles failed: %s", e)
+        return
+    knowledge_map = {k.id: k for k in knowledges}
+    for doc in documents:
+        meta = knowledge_map.get(doc.get("knowledge_id", ""))
+        if not meta:
+            continue
+        doc["knowledge_title"] = meta.title
+        if not doc.get("file_name"):
+            doc["file_name"] = meta.file_name or meta.title
+
+
 # ── Stage entrypoint ───────────────────────────────────────────────────────
 
 
@@ -167,28 +375,17 @@ async def run(
     ctx: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Select-documents 业务核心。返回结构化 dict（不含 a2ui digest）。"""
-    forced_kbs, forced_tags, forced_files = read_forced_filters(ctx)
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query 参数不能为空"}
+    hints = args.get("hints") if isinstance(args.get("hints"), dict) else {}
+    document_match_strategy = _document_match_strategy(hints)
 
     scope_plan = scope_plan_from_filters_or_context(args, ctx)
     scoped_kb_ids = scope_plan.flat_kb_ids() if scope_plan.has_scopes else []
 
-    kb_ids_raw = (
-        scoped_kb_ids
-        or (forced_kbs if forced_kbs is not None else None)
-        or args.get("knowledge_base_ids")
-        or clients.default_kb_ids
-    )
+    kb_ids_raw = scoped_kb_ids or clients.default_kb_ids
     kb_ids_in = _ensure_str_list(kb_ids_raw) or kb_ids_raw
-    kb_names = None if forced_kbs is not None else (args.get("kb_names") or None)
-    file_name_keywords = args.get("file_name_keywords") or None
-    forced_knowledge_ids = _ensure_str_list(forced_files) or forced_files
-    file_names = None if forced_files is not None else (args.get("file_names") or None)
-    tag_ids_raw = forced_tags if forced_tags is not None else (args.get("tag_ids") or None)
-    tag_ids_in = _ensure_str_list(tag_ids_raw) or tag_ids_raw
-    tag_names = None if forced_tags is not None else (args.get("tag_names") or None)
     top_k = args.get("top_k", 10)
 
     # 名称 → ID 解析
@@ -198,19 +395,10 @@ async def run(
         resolved = await resolve_filters(
             clients.postgres,
             kb_ids=kb_ids_in,
-            kb_names=kb_names,
-            tag_ids=tag_ids_in,
-            tag_names=tag_names,
-            knowledge_ids=forced_knowledge_ids,
-            file_names=file_names,
         )
     except Exception as e:
-        logger.warning("[SelectDocuments] resolve_filters failed: %s, fallback to raw ids", e)
-        resolved = ResolvedFilters(
-            kb_ids=list(kb_ids_in or []),
-            tag_ids=list(tag_ids_in or []),
-            knowledge_ids=list(forced_knowledge_ids or []),
-        )
+        logger.error("[SelectDocuments] resolve_filters failed: %s", e)
+        return {"error": f"过滤条件解析失败: {e}"}
     logger.info("[SelectDocuments] stage=resolve_filters cost_ms=%d", int((time.perf_counter() - _t_resolve) * 1000))
 
     summary_collection = clients.summary_collection
@@ -224,43 +412,35 @@ async def run(
         query_embedding = await clients.embedding.embed_query(query)
         logger.info("[SelectDocuments] stage=embed cost_ms=%d", int((time.perf_counter() - _t_embed) * 1000))
 
-        scopes = (
-            scope_plan.scopes
-            if scope_plan.has_scopes
-            else scopes_from_flat_filters(
-                kb_ids=resolved.kb_ids,
-                tag_ids=resolved.tag_ids,
-                knowledge_ids=resolved.knowledge_ids,
-                file_names=file_name_keywords or [],
-            )
-        )
+        scopes = scope_plan.scopes if scope_plan.has_scopes else [RecallScope()]
         if not scopes:
             scopes = [RecallScope()]
 
         clients.milvus.ensure_collection_loaded(summary_collection)
 
         _t_milvus = time.perf_counter()
-        search_params = {
-            "metric_type": clients.milvus._config.milvus_metric_type,
-            "params": {"nprobe": 10},
-        }
+        vector_weight = float(os.getenv("RAG_DOC_SELECT_VECTOR_WEIGHT", "0.3"))
+        keywords_weight = float(os.getenv("RAG_DOC_SELECT_BM25_WEIGHT", "0.7"))
 
         sem = asyncio.Semaphore(int(os.getenv("RAG_SCOPE_SELECT_CONCURRENCY", "3")))
 
         async def _search_scope(scope: RecallScope) -> list[dict]:
             filter_expr = scope.to_filter_expr(include_enabled=True)
             async with sem:
-                raw = await asyncio.to_thread(
-                    clients.milvus.client.search,
+                search_results = await asyncio.to_thread(
+                    clients.milvus.search,
+                    query_embedding=query_embedding,
+                    query_text=query,
+                    retriever_type=RetrieverType.HYBRID,
                     collection_name=summary_collection,
-                    data=[query_embedding],
-                    anns_field=SUMMARY_ANNS_FIELD,
-                    limit=top_k,
+                    filter_expr=filter_expr,
+                    top_k=top_k,
                     output_fields=SUMMARY_OUTPUT_FIELDS,
-                    search_params=search_params,
-                    filter=filter_expr,
+                    vector_weight=vector_weight,
+                    keywords_weight=keywords_weight,
                 )
-            docs = _parse_summary_results(raw)
+            docs = _documents_from_search_results(search_results)
+            search_mode = "hybrid"
             for doc in docs:
                 doc["scope"] = {
                     "kb_id": scope.kb_id,
@@ -268,10 +448,13 @@ async def run(
                     "source": scope.source,
                 }
             logger.info(
-                "[SelectDocuments] scope=%s docs=%d filter=%s",
+                "[SelectDocuments] scope=%s mode=%s docs=%d filter=%s weights=bm25:%.2f,vector:%.2f",
                 scope.kb_id or "*",
+                search_mode,
                 len(docs),
                 filter_expr,
+                keywords_weight,
+                vector_weight,
             )
             return docs
 
@@ -288,27 +471,50 @@ async def run(
                 continue
             documents.extend(result)
         documents = _dedup_documents(documents)
-        logger.info("[SelectDocuments] DIAG: parsed docs=%d, scopes=%d", len(documents), len(scopes))
+        await _fill_document_titles(clients, documents)
+        documents, excluded_by_hint = _apply_excluded_files(documents, hints)
+        documents = _apply_document_strategy(query=query, documents=documents, hints=hints)
+        selected_documents, rejected_documents, select_thresholds = _shortlist_documents(documents)
+        logger.info(
+            "[SelectDocuments] strategy=%s thresholds=%s candidates=%d selected=%d rejected=%d excluded=%d selected=%s rejected=%s excluded_docs=%s",
+            document_match_strategy,
+            select_thresholds,
+            len(documents) + len(excluded_by_hint),
+            len(selected_documents),
+            len(rejected_documents),
+            len(excluded_by_hint),
+            [_doc_log_item(doc) for doc in selected_documents[:8]],
+            [_doc_log_item(doc) for doc in rejected_documents[:8]],
+            [_doc_log_item(doc) for doc in excluded_by_hint[:8]],
+        )
 
-        if not documents:
+        if not selected_documents:
             return {
                 "query": query,
                 "documents": [],
                 "count": 0,
+                "document_match_strategy": document_match_strategy,
+                "document_select_thresholds": select_thresholds,
+                "rejected_documents": rejected_documents,
+                "excluded_documents": excluded_by_hint,
                 "knowledge_base_ids": resolved.kb_ids,
                 "tag_ids": resolved.tag_ids,
                 "summary": f"未在摘要库中找到匹配文档（查询: {query}）",
                 "display_type": "document_shortlist",
             }
 
-        output = _format_output(documents, query)
+        output = _format_output(selected_documents, query, document_match_strategy)
         return {
             "query": query,
-            "documents": documents,
-            "count": len(documents),
+            "documents": selected_documents,
+            "count": len(selected_documents),
+            "document_match_strategy": document_match_strategy,
+            "document_select_thresholds": select_thresholds,
+            "rejected_documents": rejected_documents,
+            "excluded_documents": excluded_by_hint,
             "knowledge_base_ids": resolved.kb_ids,
             "tag_ids": resolved.tag_ids,
-            "knowledge_ids": [d["knowledge_id"] for d in documents],
+            "knowledge_ids": [d["knowledge_id"] for d in selected_documents],
             "summary": output,
             "display_type": "document_shortlist",
         }

@@ -10,7 +10,9 @@ from typing import Any
 
 from egis_agent_plugins.core.flows.rag.clients import RAGClients
 from egis_agent_plugins.core.flows.rag.filters import resolve_filters
-from egis_agent_plugins.core.flows.rag.state import read_forced_filters
+from egis_agent_plugins.core.flows.rag._services.scope_adapter import (
+    scope_plan_from_filters_or_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,21 +99,16 @@ async def run(
         file_name = file_name[0] if file_name else ""
     file_name = str(file_name).strip()
 
-    forced_kbs, _forced_tags, forced_files = read_forced_filters(ctx)
-    kb_ids_in = (
-        forced_kbs
-        if forced_kbs is not None
-        else (args.get("knowledge_base_ids") or clients.default_kb_ids)
-    )
-    kb_names = None if forced_kbs is not None else (args.get("kb_names") or None)
+    scope_plan = scope_plan_from_filters_or_context(args, ctx)
+    scoped_kb_ids = scope_plan.flat_kb_ids()
+    scoped_knowledge_ids = scope_plan.flat_knowledge_ids()
+    kb_ids_in = scoped_kb_ids or clients.default_kb_ids
 
-    if forced_files is not None:
-        if knowledge_id and knowledge_id not in forced_files:
+    if scoped_knowledge_ids:
+        if knowledge_id and knowledge_id not in scoped_knowledge_ids:
             return {"error": "knowledge_id 不在用户选定的文档范围内"}
         if not knowledge_id and not file_name:
-            if not forced_files:
-                return {"error": "用户选定的文档范围为空"}
-            knowledge_id = forced_files[0]
+            knowledge_id = scoped_knowledge_ids[0]
 
     limit = min(args.get("limit", 20), 100)
     offset = max(args.get("offset", 0), 0)
@@ -127,8 +124,7 @@ async def run(
             resolved = await resolve_filters(
                 clients.postgres,
                 kb_ids=kb_ids_in,
-                kb_names=kb_names,
-                knowledge_ids=list(forced_files) if forced_files is not None else None,
+                knowledge_ids=scoped_knowledge_ids or None,
                 file_names=[file_name],
             )
             if not resolved.knowledge_ids:
@@ -151,7 +147,7 @@ async def run(
         # 权限校验
         if clients.default_kb_ids and knowledge.knowledge_base_id not in clients.default_kb_ids:
             return {"error": f"无权访问知识库: {knowledge.knowledge_base_id}"}
-        if forced_kbs is not None and knowledge.knowledge_base_id not in forced_kbs:
+        if scoped_kb_ids and knowledge.knowledge_base_id not in scoped_kb_ids:
             return {"error": f"文档不在用户选定的知识库范围内: {knowledge.knowledge_base_id}"}
 
         chunks, total = await clients.postgres.get_chunks_by_knowledge_id(

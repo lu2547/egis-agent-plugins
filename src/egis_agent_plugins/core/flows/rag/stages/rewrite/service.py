@@ -3,7 +3,7 @@
 对用户问题进行意图识别和改写：
 - 代词消解、省略补全、术语统一
 - 子问题拆分（最多 N 个 sub_queries）
-- 意图分类（4 类）
+- 意图分类（rag / web_search / direct）
 
 作为 query_rewrite 工具的后端服务，由 LLM 在 rag skill 引导下调用。
 """
@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,11 +26,11 @@ logger = logging.getLogger(__name__)
 
 # ── 常量 ──────────────────────────────────────────────────────────────
 
-IntentType = Literal["kb_search", "web_search", "doc_pinned", "chitchat"]
+IntentType = Literal["rag", "web_search", "direct"]
 
 _PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompt.yaml"
 
-_DEFAULT_INTENT: IntentType = "kb_search"
+_DEFAULT_INTENT: IntentType = "rag"
 
 # 代词 / 指代词含有则需要历史进行消解，否则跳过历史节约 token
 _REFERENCE_PATTERN = re.compile(
@@ -50,8 +51,10 @@ class RewriteResult:
     """Query Rewrite 输出"""
     rewrite_query: str
     sub_queries: list[str] = field(default_factory=list)
-    intent: IntentType = "kb_search"
+    intent: IntentType = "rag"
     keywords: list[str] = field(default_factory=list)
+    doc_query: str = ""
+    analysis_query: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +62,8 @@ class RewriteResult:
             "sub_queries": self.sub_queries,
             "intent": self.intent,
             "keywords": self.keywords,
+            "doc_query": self.doc_query,
+            "analysis_query": self.analysis_query,
         }
 
 
@@ -70,10 +75,10 @@ class QueryRewriteService:
     输入: 用户 query + 对话历史 + 语言
     输出: RewriteResult (改写后 query、子问题列表、意图、关键词)
 
-    失败回落: 原 query + intent=kb_search
+    失败时使用原 query + intent=rag
     """
 
-    # LLM 调用内部超时（秒），需小于 ToolExecutor 的 30s，保证超时走自身 fallback 而非硬错误
+    # LLM 调用内部超时（秒），需小于 ToolExecutor 的 30s，保证超时在 rewrite 层转换为原始 query。
     _LLM_TIMEOUT: float = 15.0
 
     def __init__(
@@ -89,7 +94,7 @@ class QueryRewriteService:
         self._system_prompt = self._load_system_prompt()
 
     def _load_system_prompt(self) -> str:
-        """加载 system prompt 模板。模板丢失是明显部署错误，直接报错不静默回落。"""
+        """加载 system prompt 模板。模板丢失是明显部署错误，直接报错。"""
         if not _PROMPT_TEMPLATE_PATH.is_file():
             raise FileNotFoundError(
                 f"Query rewrite prompt template missing: {_PROMPT_TEMPLATE_PATH}"
@@ -122,25 +127,27 @@ class QueryRewriteService:
             query: 原始用户输入
             history: 对话历史 [{"role": "user"|"assistant", "content": "..."}]
             language: 用户语言
-            pinned_knowledge_ids: 若非空，强制 intent=doc_pinned 并跳过 LLM 改写
+            pinned_knowledge_ids: 若非空，强制 intent=rag 并跳过 LLM 改写
 
         Returns:
             RewriteResult
         """
-        # 快捷路径：用户已指定文档 → 直接返回 doc_pinned
+        # 快捷路径：用户已指定文档 → 直接返回 rag
         if pinned_knowledge_ids:
             return RewriteResult(
                 rewrite_query=query,
                 sub_queries=[query],
-                intent="doc_pinned",
+                intent="rag",
                 keywords=self._extract_simple_keywords(query),
+                doc_query=query,
+                analysis_query=query,
             )
 
         try:
             result = await self._call_llm(query, history=history, language=language)
             return result
         except Exception as e:
-            logger.warning("[QueryRewrite] LLM 调用失败, 回落原始 query: %s", e)
+            logger.warning("[QueryRewrite] LLM 调用失败, 使用原始 query: %s", e)
             return RewriteResult(
                 rewrite_query=query,
                 sub_queries=[query],
@@ -169,16 +176,19 @@ class QueryRewriteService:
                 if content:
                     conv_lines.append(f"{role}: {content[:_MAX_HISTORY_CHARS]}")
 
-        user_content = f"""## Conversation History
-{chr(10).join(conv_lines) if conv_lines else "(No history)"}
+        user_content = f"""## 对话历史
+{chr(10).join(conv_lines) if conv_lines else "（无历史）"}
 
-## User Question
+## 用户问题
 {query}
 
-## Language
+## 当前日期
+{date.today().isoformat()}
+
+## 语言
 {language}
 
-## JSON Output"""
+## JSON 输出"""
 
         messages = [
             SystemMessage(content=self._system_prompt),
@@ -222,6 +232,8 @@ class QueryRewriteService:
             )
 
         rewrite_query = data.get("rewrite_query", original_query) or original_query
+        doc_query = data.get("doc_query", "") or ""
+        analysis_query = data.get("analysis_query", "") or ""
         sub_queries = data.get("sub_queries", [rewrite_query])
         if not sub_queries:
             sub_queries = [rewrite_query]
@@ -229,23 +241,34 @@ class QueryRewriteService:
         sub_queries = sub_queries[: self._max_sub_queries]
 
         intent = data.get("intent", _DEFAULT_INTENT)
-        if intent not in ("kb_search", "web_search", "doc_pinned", "chitchat"):
+        if intent not in ("rag", "web_search", "direct"):
             intent = _DEFAULT_INTENT
 
         keywords = data.get("keywords", [])
         if not isinstance(keywords, list):
             keywords = []
 
+        if intent == "rag":
+            if not doc_query:
+                doc_query = rewrite_query
+            if not analysis_query:
+                analysis_query = original_query
+        else:
+            doc_query = ""
+            analysis_query = ""
+
         return RewriteResult(
             rewrite_query=rewrite_query,
             sub_queries=sub_queries,
             intent=intent,
             keywords=keywords[:5],
+            doc_query=doc_query,
+            analysis_query=analysis_query,
         )
 
     @staticmethod
     def _extract_simple_keywords(query: str) -> list[str]:
-        """简单关键词提取（回落用，不依赖 LLM）"""
+        """简单关键词提取（不依赖 LLM）"""
         import re
         # 去除标点，按空格/标点分词，取长度>=2的片段
         tokens = re.split(r'[\s,，。！？、；：""''（）()\[\]{}]+', query)

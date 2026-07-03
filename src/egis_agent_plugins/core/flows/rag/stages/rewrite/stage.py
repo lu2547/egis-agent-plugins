@@ -35,7 +35,7 @@ async def run(
 ) -> dict[str, Any]:
     """Query rewrite 业务核心。
 
-    Returns dict: ``{"intent", "keywords", "sub_queries", "rewrite_query"}``
+    Returns dict: ``{"intent", "keywords", "sub_queries", "rewrite_query", "doc_query", "analysis_query"}``
     """
     query = (args.get("query") or "").strip()
     if not query:
@@ -48,9 +48,12 @@ async def run(
     try:
         service = _get_service()
     except Exception as e:
-        logger.warning("[QueryRewrite] LLM 初始化失败，回落原始 query: %s", e)
+        logger.warning("[QueryRewrite] LLM 初始化失败，使用原始 query: %s", e)
         return RewriteResult(
-            rewrite_query=query, sub_queries=[query], intent="kb_search", keywords=[],
+            rewrite_query=query,
+            sub_queries=[query],
+            intent="rag",
+            keywords=[],
         ).to_dict()
 
     try:
@@ -58,9 +61,12 @@ async def run(
             query, history=history, language=language, pinned_knowledge_ids=pinned,
         )
     except Exception as e:
-        logger.warning("[QueryRewrite] rewrite 失败，回落原始 query: %s", e)
+        logger.warning("[QueryRewrite] rewrite 失败，使用原始 query: %s", e)
         result = RewriteResult(
-            rewrite_query=query, sub_queries=[query], intent="kb_search", keywords=[],
+            rewrite_query=query,
+            sub_queries=[query],
+            intent="rag",
+            keywords=[],
         )
 
     return result.to_dict()

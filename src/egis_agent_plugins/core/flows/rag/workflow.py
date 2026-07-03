@@ -31,18 +31,18 @@ from .guards import (
     _evidence_sufficient,
     _has_candidates,
     _has_selected_docs,
-    _is_obvious_no_retrieval,
     _no_candidates,
     _no_selected_docs,
     _retry_exhausted_has_partial,
     _retry_exhausted_no_evidence,
-    _route_internal,
+    _route_no_retrieval,
+    _route_rag,
     _route_web,
     _web_requested_but_disabled,
+    is_obvious_no_retrieval_query,
 )
 from .events import emit_progress, emit_references
 from .schema import Candidate, Reference, new_instance_data
-from .stages.read.stage import run as _read_run
 from .stages.rank.stage import run as _rank_run
 from .stages.recall.stage import run as _recall_run
 from .stages.recall.web import run as _web_run
@@ -50,6 +50,7 @@ from .stages.rewrite.stage import run as _rewrite_run
 from .stages.select.stage import run as _select_run
 
 # 前端 rag_state 硬覆盖过滤器
+from egis_agent_plugins.core.flows.rag._services.document_reader import read_ranked_context
 from egis_agent_plugins.core.flows.rag._services.scope_adapter import read_rag_state
 
 logger = logging.getLogger(__name__)
@@ -60,8 +61,6 @@ logger = logging.getLogger(__name__)
 
 def _has_doc_scope(filters: dict[str, Any]) -> bool:
     """Whether the user explicitly constrained retrieval to documents/files."""
-    if filters.get("knowledge_ids") or filters.get("file_names"):
-        return True
     for kb in filters.get("rag_filter") or []:
         if not isinstance(kb, dict):
             continue
@@ -73,15 +72,22 @@ def _has_doc_scope(filters: dict[str, Any]) -> bool:
     return False
 
 
-def _has_kb_or_tag_scope(filters: dict[str, Any]) -> bool:
-    """Whether the user constrained retrieval to KB/tag scope."""
-    return bool(
-        filters.get("knowledge_base_ids")
-        or filters.get("kb_names")
-        or filters.get("tag_ids")
-        or filters.get("tag_names")
-        or filters.get("rag_filter")
-    )
+def _routed_web(ictx: InstanceCtx) -> None:
+    if ictx.probing:
+        return
+    if ictx.instance_data.get("route") == "web":
+        return
+    from ark_agentic.core.workflow.errors import WorkflowRejection
+    raise WorkflowRejection(code="guard", message="not web route")
+
+
+def _routed_rag(ictx: InstanceCtx) -> None:
+    if ictx.probing:
+        return
+    if ictx.instance_data.get("route") == "rag":
+        return
+    from ark_agentic.core.workflow.errors import WorkflowRejection
+    raise WorkflowRejection(code="guard", message="not rag route")
 
 
 # ── Workflow class ───────────────────────────────────────────────────────
@@ -99,7 +105,8 @@ class RagRetrievalWorkflow(Workflow):
     states: ClassVar[tuple[str, ...]] = (
         "rewrite_pending",
         "rewritten",
-        "docs_selected",
+        "routed",
+        "branch_recalled",
         "recalled",
         "ranked",
         "evidence_checked",
@@ -132,33 +139,39 @@ class RagRetrievalWorkflow(Workflow):
 
     def _build_transitions(self) -> tuple[Transition, ...]:
         return (
-            # ── start: 两条 guarded fork ──
-            Transition("start", None, "no_retrieval",
-                       guard=_is_obvious_no_retrieval,
-                       effect=self._ef_start_no_retrieval),
-            Transition("start", None, "rewrite_pending",
-                       effect=self._ef_start_init),
-
             # ── rewrite ──
+            Transition("rewrite", None, "rewritten",
+                       effect=self._ef_rewrite),
             Transition("rewrite", "rewrite_pending", "rewritten",
                        effect=self._ef_rewrite),
 
-            # ── route: 三条 guarded fork（顺序关键）──
+            # ── route: guarded fork（顺序关键）──
+            Transition("route", "rewritten", "no_retrieval",
+                       guard=_route_no_retrieval,
+                       effect=self._ef_route_no_retrieval),
             Transition("route", "rewritten", "no_evidence",
                        guard=_web_requested_but_disabled,
                        effect=self._ef_route_web_unavailable),
-            Transition("route", "rewritten", "recalled",
+            Transition("route", "rewritten", "routed",
                        guard=_route_web,
                        effect=self._ef_route_web),
-            Transition("route", "rewritten", "docs_selected",
-                       guard=_route_internal,
-                       effect=self._ef_route_internal),
+            Transition("route", "rewritten", "routed",
+                       guard=_route_rag,
+                       effect=self._ef_route_rag),
 
-            # ── recall: 两条 guarded fork ──
-            Transition("recall", "docs_selected", "recalled",
+            # ── branch recall: route-specific first recall ──
+            Transition("branch_recall", "routed", "recalled",
+                       guard=_routed_web,
+                       effect=self._ef_branch_recall_web),
+            Transition("branch_recall", "routed", "branch_recalled",
+                       guard=_routed_rag,
+                       effect=self._ef_branch_recall_rag),
+
+            # ── chunk recall: selected docs → chunks ──
+            Transition("chunk_recall", "branch_recalled", "recalled",
                        guard=_has_selected_docs,
-                       effect=self._ef_recall_scoped),
-            Transition("recall", "docs_selected", "insufficient",
+                       effect=self._ef_chunk_recall_rag),
+            Transition("chunk_recall", "branch_recalled", "insufficient",
                        guard=_no_selected_docs,
                        effect=self._ef_mark_no_docs),
 
@@ -213,6 +226,7 @@ class RagRetrievalWorkflow(Workflow):
             query=ictx.args.get("query", ""),
             source=ictx.args.get("source", "auto"),
             filters=ictx.args.get("filters"),
+            hints=ictx.args.get("hints") or {},
             max_retries=int(ictx.args.get("max_retries", 1)),
         )
         ictx.instance_data.update(data)
@@ -231,24 +245,54 @@ class RagRetrievalWorkflow(Workflow):
     async def _ef_rewrite(self, ictx: InstanceCtx) -> EffectOutput | None:
         t0 = time.perf_counter()
         ctx = ictx.session_ctx
+
+        if not ictx.instance_data.get("query"):
+            data = new_instance_data(
+                query=ictx.args.get("query", ""),
+                source=ictx.args.get("source", "auto"),
+                filters=ictx.args.get("filters"),
+                hints=ictx.args.get("hints") or {},
+                max_retries=int(ictx.args.get("max_retries", 1)),
+            )
+            ictx.instance_data.update(data)
+
+            filters = ictx.instance_data.setdefault("filters", {}) or {}
+            if not filters.get("rag_filter"):
+                rag_state = read_rag_state(ictx.session_ctx)
+                rag_filter = rag_state.get("rag_filter") or rag_state.get("rag_filters")
+                if isinstance(rag_filter, list) and rag_filter:
+                    filters["rag_filter"] = rag_filter
+
+        query = ictx.instance_data.get("query", "")
+        if is_obvious_no_retrieval_query(query):
+            ictx.instance_data["rewrite"] = {
+                "intent": "direct",
+                "keywords": [],
+                "sub_queries": [query],
+                "rewrite_query": query,
+                "doc_query": "",
+                "analysis_query": "",
+            }
+            ictx.instance_data["timings"]["rewrite_ms"] = int((time.perf_counter() - t0) * 1000)
+            return None
+
         emit_progress(ctx, tool="query_rewrite", status="pending")
 
-        filters = ictx.instance_data.get("filters") or {}
         result = await _rewrite_run(
             args={
-                "query": ictx.instance_data.get("query", ""),
-                "pinned_knowledge_ids": filters.get("knowledge_ids") or None,
+                "query": query,
             },
             ctx=ctx,
             clients=self._clients,
         )
 
-        emit_progress(ctx, tool="query_rewrite", status="done")
-
-        intent = result.get("intent", "kb_search")
+        raw_intent = result.get("intent", "rag")
+        intent = raw_intent if raw_intent in ("web_search", "direct") else "rag"
         keywords = result.get("keywords", [])
         sub_queries = result.get("sub_queries", [])
         rewrite_query = result.get("rewrite_query", "")
+        doc_query = result.get("doc_query", "")
+        analysis_query = result.get("analysis_query", "")
 
         # 如果 LLM 没传 source 但 intent=web_search，设置 source=web
         if ictx.instance_data.get("source") == "auto" and intent == "web_search":
@@ -259,7 +303,24 @@ class RagRetrievalWorkflow(Workflow):
             "keywords": keywords,
             "sub_queries": sub_queries,
             "rewrite_query": rewrite_query,
+            "doc_query": doc_query,
+            "analysis_query": analysis_query,
         }
+
+        emit_progress(
+            ctx,
+            tool="query_rewrite",
+            status="done",
+            extra={
+                "rewrite": rewrite_query,
+                "doc_query": doc_query,
+                "analysis_query": analysis_query,
+                "intent": intent,
+                "route": intent,
+                "keywords": keywords,
+                "sub_queries": sub_queries,
+            },
+        )
 
         ictx.instance_data["timings"]["rewrite_ms"] = int((time.perf_counter() - t0) * 1000)
         return None
@@ -268,15 +329,28 @@ class RagRetrievalWorkflow(Workflow):
         ictx.instance_data["route"] = "web_unavailable"
         return EffectOutput(message="Web 搜索服务暂未配置，无法获取实时信息。")
 
+    async def _ef_route_no_retrieval(self, ictx: InstanceCtx) -> EffectOutput | None:
+        ictx.instance_data["route"] = "no_retrieval"
+        return EffectOutput(message="问题无需检索，可直接回答。")
+
     async def _ef_route_web(self, ictx: InstanceCtx) -> EffectOutput | None:
-        t0 = time.perf_counter()
         ctx = ictx.session_ctx
         ictx.instance_data["route"] = "web"
+        emit_progress(ctx, tool="route", status="done", extra={"route": "web_search"})
+        return None
+
+    async def _ef_branch_recall_web(self, ictx: InstanceCtx) -> EffectOutput | None:
+        t0 = time.perf_counter()
+        ctx = ictx.session_ctx
 
         emit_progress(ctx, tool="web_search", status="pending")
 
         rewrite = ictx.instance_data.get("rewrite") or {}
-        query = rewrite.get("rewrite_query") or ictx.instance_data.get("query", "")
+        query = (
+            rewrite.get("analysis_query")
+            or rewrite.get("rewrite_query")
+            or ictx.instance_data.get("query", "")
+        )
 
         result = await _web_run(args={"query": query}, ctx=ctx)
         web_results = result.get("results", [])
@@ -303,81 +377,113 @@ class RagRetrievalWorkflow(Workflow):
         ictx.instance_data["timings"]["recall_ms"] = int((time.perf_counter() - t0) * 1000)
         return None
 
-    async def _ef_route_internal(self, ictx: InstanceCtx) -> EffectOutput | None:
-        """Internal route — select documents, then scoped hybrid recall.
+    async def _ef_route_rag(self, ictx: InstanceCtx) -> EffectOutput | None:
+        """RAG route decision only."""
+        ctx = ictx.session_ctx
+        ictx.instance_data["route"] = "rag"
+        emit_progress(ctx, tool="route", status="done", extra={"route": "rag"})
+        return None
 
-        Explicit ``knowledge_ids`` are treated as an already selected scope.
-        If the selector is unavailable, the workflow may fall back to full-scope
-        recall; if the selector runs and returns no docs, recall is blocked.
-        """
+    async def _ef_branch_recall_rag(self, ictx: InstanceCtx) -> EffectOutput | None:
+        """RAG branch recall — select documents by filename + summary."""
         t0 = time.perf_counter()
         ctx = ictx.session_ctx
-        ictx.instance_data["route"] = "internal"
 
         rewrite = ictx.instance_data.get("rewrite") or {}
         filters = ictx.instance_data.get("filters") or {}
-
-        explicit_ids = filters.get("knowledge_ids") or []
-        if explicit_ids:
-            ictx.instance_data["selected_knowledge_ids"] = explicit_ids
-            ictx.instance_data["allow_full_scope_recall"] = False
-            ictx.instance_data["timings"]["route_ms"] = int((time.perf_counter() - t0) * 1000)
-            return None
+        doc_query = (
+            rewrite.get("doc_query")
+            or rewrite.get("rewrite_query")
+            or ictx.instance_data.get("query", "")
+        )
 
         sd_args: dict[str, Any] = {
-            "query": rewrite.get("rewrite_query")
-                     or ictx.instance_data.get("query", ""),
+            "query": doc_query,
+            "top_k": int(os.getenv("RAG_DOCUMENT_SELECT_TOP_K", "20")),
+            "hints": ictx.instance_data.get("hints") or {},
         }
-        if filters.get("knowledge_base_ids"):
-            sd_args["knowledge_base_ids"] = filters["knowledge_base_ids"]
-        if filters.get("kb_names"):
-            sd_args["kb_names"] = filters["kb_names"]
-        if filters.get("file_names"):
-            sd_args["file_names"] = filters["file_names"]
-        if filters.get("tag_ids"):
-            sd_args["tag_ids"] = filters["tag_ids"]
-        if filters.get("tag_names"):
-            sd_args["tag_names"] = filters["tag_names"]
         if filters.get("rag_filter"):
             sd_args["rag_filter"] = filters["rag_filter"]
+
+        emit_progress(
+            ctx,
+            tool="document_select",
+            status="pending",
+            extra={
+                "query": doc_query,
+                "document_match_strategy": {
+                    "hints": ictx.instance_data.get("hints") or {},
+                },
+            },
+        )
 
         try:
             result = await _select_run(clients=self._clients, args=sd_args, ctx=ctx)
         except Exception as e:
-            if _has_doc_scope(filters):
-                logger.warning(
-                    "[RAG WF] select_documents failed under document scope: %s; block fallback",
-                    e,
-                )
-                ictx.instance_data["selected_knowledge_ids"] = []
-                ictx.instance_data["allow_full_scope_recall"] = False
-                ictx.instance_data["timings"]["route_ms"] = int((time.perf_counter() - t0) * 1000)
-                return None
-            logger.warning("[RAG WF] select_documents failed: %s, fallback within configured scope", e)
+            logger.warning("[RAG WF] rag select_documents failed: %s", e)
             ictx.instance_data["selected_knowledge_ids"] = []
-            ictx.instance_data["allow_full_scope_recall"] = True
-            ictx.instance_data["timings"]["route_ms"] = int((time.perf_counter() - t0) * 1000)
+            ictx.instance_data["candidates"] = []
+            ictx.instance_data["timings"]["branch_recall_ms"] = int((time.perf_counter() - t0) * 1000)
+            emit_progress(
+                ctx,
+                tool="document_select",
+                status="error",
+                extra={"query": doc_query, "error": str(e)},
+            )
             return None
+
         kid_list = result.get("knowledge_ids", [])
         ictx.instance_data["selected_knowledge_ids"] = kid_list
         ictx.instance_data["selected_documents"] = result.get("documents", [])
-        logger.info("[RAG WF] select_documents → %d docs", len(kid_list))
+        ictx.instance_data["document_match_strategy"] = result.get("document_match_strategy") or {}
+        ictx.instance_data["document_select_thresholds"] = result.get("document_select_thresholds") or {}
+        ictx.instance_data["rejected_documents"] = result.get("rejected_documents") or []
+        ictx.instance_data["excluded_documents"] = result.get("excluded_documents") or []
+        ictx.instance_data["candidates"] = []
+        emit_progress(
+            ctx,
+            tool="document_select",
+            status="done",
+            count=len(kid_list),
+            extra={
+                "query": doc_query,
+                "documents": [
+                    {
+                        "knowledge_id": doc.get("knowledge_id", ""),
+                        "title": doc.get("knowledge_title") or doc.get("file_name", ""),
+                        "score": doc.get("score", 0.0),
+                        "document_match_scores": doc.get("document_match_scores", {}),
+                    }
+                    for doc in result.get("documents", [])[:8]
+                ],
+                "rejected_documents": [
+                    {
+                        "knowledge_id": doc.get("knowledge_id", ""),
+                        "title": doc.get("knowledge_title") or doc.get("file_name", ""),
+                        "score": doc.get("score", 0.0),
+                        "document_match_scores": doc.get("document_match_scores", {}),
+                    }
+                    for doc in result.get("rejected_documents", [])[:8]
+                ],
+                "excluded_documents": [
+                    {
+                        "knowledge_id": doc.get("knowledge_id", ""),
+                        "title": doc.get("knowledge_title") or doc.get("file_name", ""),
+                        "score": doc.get("score", 0.0),
+                    }
+                    for doc in result.get("excluded_documents", [])[:8]
+                ],
+                "document_match_strategy": result.get("document_match_strategy") or {},
+                "document_select_thresholds": result.get("document_select_thresholds") or {},
+            },
+        )
+        logger.info("[RAG WF] rag → selected docs=%d; recall chunks next", len(kid_list))
+        ictx.instance_data["timings"]["branch_recall_ms"] = int((time.perf_counter() - t0) * 1000)
+        return None
 
-        if kid_list:
-            # 有选中文档 → 限定范围检索
-            ictx.instance_data["allow_full_scope_recall"] = False
-        elif _has_doc_scope(filters):
-            logger.info("[RAG WF] select_documents 空结果 + 文档约束存在 → 阻断越界回退")
-            ictx.instance_data["allow_full_scope_recall"] = False
-        elif _has_kb_or_tag_scope(filters):
-            # 0 篇结果 + KB/tag 过滤器 → 允许在同一 KB/tag 范围内回退到 chunk search
-            logger.info("[RAG WF] select_documents 空结果 + KB/tag 过滤器存在 → 允许 scoped fallback")
-            ictx.instance_data["allow_full_scope_recall"] = True
-        else:
-            # 0 篇结果且无过滤器 → 保持 retry 设置的全域允许状态
-            pass
-
-        ictx.instance_data["timings"]["route_ms"] = int((time.perf_counter() - t0) * 1000)
+    async def _ef_chunk_recall_rag(self, ictx: InstanceCtx) -> EffectOutput | None:
+        """RAG chunk recall — search chunks inside selected documents."""
+        await self._ef_recall_scoped(ictx)
         return None
 
     async def _ef_recall_scoped(self, ictx: InstanceCtx) -> EffectOutput | None:
@@ -408,7 +514,7 @@ class RagRetrievalWorkflow(Workflow):
 
         ks_args: dict[str, Any] = {"queries": queries}
 
-        # Scope by knowledge_ids
+        # Scope by selected documents from the document selector.
         kid_list = ictx.instance_data.get("selected_knowledge_ids") or []
         if kid_list:
             ks_args["knowledge_ids"] = kid_list
@@ -416,24 +522,20 @@ class RagRetrievalWorkflow(Workflow):
         if selected_documents:
             ks_args["selected_documents"] = selected_documents
 
-        # Pass filters
+        # Pass only the structured frontend scope. Flat legacy filters are not
+        # part of the current RAG contract.
         filters = ictx.instance_data.get("filters") or {}
-        if filters.get("knowledge_base_ids"):
-            ks_args["knowledge_base_ids"] = filters["knowledge_base_ids"]
-        if filters.get("kb_names"):
-            ks_args["kb_names"] = filters["kb_names"]
-        if filters.get("tag_ids"):
-            ks_args["tag_ids"] = filters["tag_ids"]
-        if filters.get("tag_names"):
-            ks_args["tag_names"] = filters["tag_names"]
-        if filters.get("file_names"):
-            ks_args["file_names"] = filters["file_names"]
         if filters.get("rag_filter"):
             ks_args["rag_filter"] = filters["rag_filter"]
 
         candidates: list[dict[str, Any]] = []
         try:
-            result = await _recall_run(clients=self._clients, args=ks_args, ctx=ctx)
+            result = await _recall_run(
+                clients=self._clients,
+                args=ks_args,
+                ctx=ctx,
+                top_k=int(os.getenv("RAG_CHUNK_RECALL_TOP_K", "40")),
+            )
         except Exception as e:
             logger.warning("[RAG WF] knowledge_search failed: %s", e)
             result = {}
@@ -479,7 +581,11 @@ class RagRetrievalWorkflow(Workflow):
         t0 = time.perf_counter()
         candidates = ictx.instance_data.get("candidates") or []
         rewrite = ictx.instance_data.get("rewrite") or {}
-        query = rewrite.get("rewrite_query") or ictx.instance_data.get("query", "")
+        query = (
+            rewrite.get("analysis_query")
+            or rewrite.get("rewrite_query")
+            or ictx.instance_data.get("query", "")
+        )
         queries = [query] if query else []
         for sq in rewrite.get("sub_queries", []):
             if sq and sq not in queries:
@@ -492,6 +598,13 @@ class RagRetrievalWorkflow(Workflow):
         )
 
         ictx.instance_data["ranked"] = result.get("ranked", [])
+        emit_progress(
+            ictx.session_ctx,
+            tool="rank",
+            status="done",
+            count=len(ictx.instance_data["ranked"]),
+            extra={"queries": queries[:3]},
+        )
         ictx.instance_data["timings"]["rank_ms"] = (
             result.get("rank_ms")
             if result.get("rank_ms") is not None
@@ -504,13 +617,7 @@ class RagRetrievalWorkflow(Workflow):
         return None
 
     async def _ef_parallel_read_and_assess(self, ictx: InstanceCtx) -> EffectOutput | None:
-        """Deep-read full small docs or dynamically expand short anchor chunks.
-
-        Small selected documents are cheap and safest to read in full. For large
-        documents, anchors whose content >= EXPAND_MIN_LEN (350) are used directly;
-        short anchors (< 350 chars) are expanded by reading up to EXPAND_MAX_CHUNKS
-        (10) adjacent chunks, capped at EXPAND_MAX_LEN (1000) total characters.
-        """
+        """Read ranked chunk anchors into evidence via the document reader."""
         t0 = time.perf_counter()
         ctx = ictx.session_ctx
         ranked = ictx.instance_data.get("ranked") or []
@@ -520,312 +627,27 @@ class RagRetrievalWorkflow(Workflow):
             ictx.instance_data["evidence_sufficient"] = False
             return None
 
-        # Take top N matched chunks as anchors.
-        top_k = int(os.getenv("RAG_EVIDENCE_TOP_K", "8"))
-        top_items = ranked[:top_k]
-        evidence: list[dict[str, Any]] = []
-
-        # -- Dynamic expansion parameters (similar to weknora) --
-        expand_min_len = int(os.getenv("RAG_EXPAND_MIN_LEN", "350"))
-        expand_max_len = int(os.getenv("RAG_EXPAND_MAX_LEN", "1000"))
-        expand_max_chunks = int(os.getenv("RAG_EXPAND_MAX_CHUNKS", "10"))
-        small_doc_limit = max(1, int(os.getenv("RAG_SMALL_DOC_CHUNK_LIMIT", "50")))
-
-        anchors_by_kid: dict[str, list[dict[str, Any]]] = {}
-        for item in top_items:
-            if item.get("source") != "internal":
-                continue
-            kid = item.get("knowledge_id", "")
-            if kid:
-                anchors_by_kid.setdefault(kid, []).append(item)
-
-        doc_ids: list[str] = []
-        for item in top_items:
-            if item.get("source") != "internal":
-                continue
-            kid = item.get("knowledge_id", "")
-            if kid and kid not in doc_ids:
-                doc_ids.append(kid)
-        for kid in ictx.instance_data.get("selected_knowledge_ids") or []:
-            if kid and kid not in doc_ids:
-                doc_ids.append(kid)
-
-        doc_counts: dict[str, int] = {}
-        pg = getattr(self._clients, "postgres", None)
-        if pg is not None and doc_ids:
-            try:
-                await pg.connect()
-                counts = await asyncio.gather(
-                    *(pg.get_chunk_count_by_knowledge_id(kid) for kid in doc_ids),
-                    return_exceptions=True,
-                )
-                for kid, count in zip(doc_ids, counts):
-                    if isinstance(count, Exception):
-                        logger.warning("[RAG WF] chunk count failed kid=%s: %s", kid, count)
-                        continue
-                    doc_counts[kid] = int(count or 0)
-            except Exception as e:
-                logger.warning("[RAG WF] chunk count batch failed: %s", e)
-
-        if doc_ids:
-            read_specs: list[dict[str, Any]] = []
-
-            for kid in doc_ids:
-                total = doc_counts.get(kid)
-                anchors = anchors_by_kid.get(kid, [])
-
-                # Small doc: read in full.
-                if total is not None and 0 < total <= small_doc_limit:
-                    anchor = anchors[0] if anchors else {"knowledge_id": kid}
-                    read_specs.append({
-                        "mode": "full_small_doc",
-                        "anchor": anchor,
-                        "anchors": anchors,
-                        "knowledge_id": kid,
-                        "offset": 0,
-                        "limit": small_doc_limit,
-                        "anchor_chunk_ids": {
-                            a.get("chunk_id", a.get("id", "")) for a in anchors
-                            if a.get("chunk_id", a.get("id", ""))
-                        },
-                    })
-                    continue
-
-                if not anchors:
-                    continue
-
-                # -- Dynamic context expansion per anchor --
-                for anchor in anchors:
-                    anchor_content = (anchor.get("content") or "").strip()
-                    anchor_chunk_id = anchor.get("chunk_id", anchor.get("id", ""))
-
-                    if len(anchor_content) >= expand_min_len:
-                        # Large chunk: use directly, no expansion needed.
-                        evidence.append({
-                            "knowledge_id": kid,
-                            "knowledge_title": anchor.get("knowledge_title", ""),
-                            "chunk_id": anchor_chunk_id,
-                            "chunk_index": anchor.get("chunk_index", 0),
-                            "content": anchor_content,
-                            "score": anchor.get("score", 0.0),
-                            "anchor_score": anchor.get("score", 0.0),
-                            "source_query": anchor.get("source_query", ""),
-                            "anchor_chunk_id": anchor_chunk_id,
-                            "anchor_chunk_ids": [anchor_chunk_id],
-                            "is_anchor": True,
-                            "read_mode": "direct",
-                        })
-                    else:
-                        # Short chunk: needs context expansion.
-                        try:
-                            center_idx = int(anchor.get("chunk_index", 0) or 0)
-                        except (TypeError, ValueError):
-                            center_idx = 0
-                        read_specs.append({
-                            "mode": "expand_context",
-                            "anchor": anchor,
-                            "anchors": [anchor],
-                            "knowledge_id": kid,
-                            "center_index": center_idx,
-                            "anchor_chunk_ids": {anchor_chunk_id} if anchor_chunk_id else set(),
-                        })
-
-            # -- Execute full_small_doc reads (via existing list-chunks) --
-            small_doc_specs = [s for s in read_specs if s["mode"] == "full_small_doc"]
-            expand_specs = [s for s in read_specs if s["mode"] == "expand_context"]
-
-            # Deduplicate small doc reads
-            seen_small: set[str] = set()
-            deduped_small: list[dict[str, Any]] = []
-            for spec in small_doc_specs:
-                kid = spec["knowledge_id"]
-                if kid in seen_small:
-                    continue
-                seen_small.add(kid)
-                deduped_small.append(spec)
-
-            # Read small docs via _read_run
-            if deduped_small:
-                small_tasks = [
-                    (
-                        spec,
-                        _read_run(
-                            clients=self._clients,
-                            args={
-                                "knowledge_id": spec["knowledge_id"],
-                                "offset": spec["offset"],
-                                "limit": spec["limit"],
-                            },
-                            ctx=ctx,
-                        ),
-                    )
-                    for spec in deduped_small
-                ]
-                small_results = await asyncio.gather(
-                    *(task for _spec, task in small_tasks),
-                    return_exceptions=True,
-                )
-                seen_chunks: set[str] = set()
-                for (spec, _task), result in zip(small_tasks, small_results):
-                    if isinstance(result, Exception):
-                        logger.warning(
-                            "[RAG WF] small doc read %s failed: %s",
-                            spec.get("knowledge_id", ""), result,
-                        )
-                        continue
-                    anchor = spec.get("anchor") or {}
-                    anchors_list = spec.get("anchors") or []
-                    anchor_chunk_ids = spec.get("anchor_chunk_ids") or set()
-                    chunks = result.get("chunks", result.get("results", []))
-                    title = result.get("knowledge_title") or anchor.get("knowledge_title", "")
-                    for chunk in chunks:
-                        chunk_id = chunk.get("chunk_id", chunk.get("id", ""))
-                        content = (chunk.get("content") or "").strip()
-                        if not chunk_id or chunk_id in seen_chunks or not content:
-                            continue
-                        seen_chunks.add(chunk_id)
-                        is_anchor = chunk_id in anchor_chunk_ids
-                        evidence.append({
-                            "knowledge_id": spec["knowledge_id"],
-                            "knowledge_title": title,
-                            "chunk_id": chunk_id,
-                            "chunk_index": chunk.get("chunk_index", 0),
-                            "content": content,
-                            "score": anchor.get("score", 0.0) if is_anchor else 0.0,
-                            "anchor_score": anchor.get("score", 0.0),
-                            "source_query": anchor.get("source_query", ""),
-                            "anchor_chunk_id": anchor.get("chunk_id", anchor.get("id", "")),
-                            "anchor_chunk_ids": sorted(anchor_chunk_ids),
-                            "is_anchor": is_anchor,
-                            "read_mode": "full_small_doc",
-                        })
-
-            # -- Execute dynamic expansion reads via get_chunks_around_index --
-            if expand_specs and pg is not None:
-                # Deduplicate by (knowledge_id, center_index)
-                seen_expand: set[tuple[str, int]] = set()
-                deduped_expand: list[dict[str, Any]] = []
-                for spec in expand_specs:
-                    key = (spec["knowledge_id"], spec["center_index"])
-                    if key in seen_expand:
-                        continue
-                    seen_expand.add(key)
-                    deduped_expand.append(spec)
-
-                expand_tasks = [
-                    (
-                        spec,
-                        pg.get_chunks_around_index(
-                            spec["knowledge_id"],
-                            spec["center_index"],
-                            radius=expand_max_chunks // 2,
-                        ),
-                    )
-                    for spec in deduped_expand
-                ]
-                expand_results = await asyncio.gather(
-                    *(task for _spec, task in expand_tasks),
-                    return_exceptions=True,
-                )
-                seen_expand_chunks: set[str] = set()
-                for (spec, _task), result in zip(expand_tasks, expand_results):
-                    if isinstance(result, Exception):
-                        logger.warning(
-                            "[RAG WF] expand read %s idx=%s failed: %s",
-                            spec.get("knowledge_id", ""),
-                            spec.get("center_index", ""),
-                            result,
-                        )
-                        continue
-                    anchor = spec["anchor"]
-                    anchor_chunk_id = anchor.get("chunk_id", anchor.get("id", ""))
-                    center_idx = spec["center_index"]
-                    title = anchor.get("knowledge_title", "")
-
-                    # Sort neighbors by distance from center (anchor first)
-                    neighbor_chunks: list[Any] = sorted(
-                        result, key=lambda c: abs(c.chunk_index - center_idx)
-                    )
-
-                    # Walk outward, accumulate up to expand_max_len chars / expand_max_chunks
-                    accumulated_len = 0
-                    collected_count = 0
-                    for chunk in neighbor_chunks:
-                        chunk_id = chunk.id
-                        content = (chunk.content or "").strip()
-                        if not chunk_id or chunk_id in seen_expand_chunks or not content:
-                            continue
-                        if collected_count >= expand_max_chunks:
-                            break
-                        if accumulated_len >= expand_max_len:
-                            break
-                        seen_expand_chunks.add(chunk_id)
-                        accumulated_len += len(content)
-                        collected_count += 1
-                        is_anchor_chunk = (chunk_id == anchor_chunk_id)
-                        evidence.append({
-                            "knowledge_id": spec["knowledge_id"],
-                            "knowledge_title": title,
-                            "chunk_id": chunk_id,
-                            "chunk_index": chunk.chunk_index,
-                            "content": content,
-                            "score": anchor.get("score", 0.0) if is_anchor_chunk else 0.0,
-                            "anchor_score": anchor.get("score", 0.0),
-                            "source_query": anchor.get("source_query", ""),
-                            "anchor_chunk_id": anchor_chunk_id,
-                            "anchor_chunk_ids": sorted(spec.get("anchor_chunk_ids") or set()),
-                            "is_anchor": is_anchor_chunk,
-                            "read_mode": "expand_context",
-                        })
-
-            logger.info(
-                "[RAG WF] deep read DIAG: docs=%d counts=%d small_specs=%d expand_specs=%d evidence=%d "
-                "expand_min_len=%d expand_max_len=%d expand_max_chunks=%d",
-                len(doc_ids),
-                len(doc_counts),
-                len(deduped_small) if deduped_small else 0,
-                len(deduped_expand) if expand_specs and pg else 0,
-                len(evidence),
-                expand_min_len,
-                expand_max_len,
-                expand_max_chunks,
-            )
-
-        # Fallback: if deep-read is unavailable/empty, use reranked hit chunks.
-        if not evidence:
-            for item in top_items:
-                content = (item.get("content") or "").strip()
-                if not content:
-                    continue
-                chunk_id = item.get("chunk_id", item.get("id", ""))
-                evidence.append({
-                    "knowledge_id": item.get("knowledge_id", ""),
-                    "knowledge_title": item.get("knowledge_title", ""),
-                    "chunk_id": chunk_id,
-                    "chunk_index": item.get("chunk_index", 0),
-                    "content": content,
-                    "score": item.get("score", 0.0),
-                    "source_query": item.get("source_query", ""),
-                    "anchor_chunk_id": chunk_id,
-                    "is_anchor": True,
-                })
-
-        ictx.instance_data["evidence"] = evidence
-
-        # Assess sufficiency: at least one usable grounding chunk. If a
-        # threshold is configured, keep it as an extra quality gate.
-        sufficiency_threshold = float(
-            os.getenv("RAG_SUFFICIENCY_THRESHOLD", "0.0")
+        evidence = await read_ranked_context(
+            clients=self._clients,
+            ranked=ranked,
+            top_k=int(os.getenv("RAG_EVIDENCE_TOP_K", "8")),
         )
-        if sufficiency_threshold > 0:
-            high_quality = [
-                e for e in evidence
-                if e.get("score", 0.0) >= sufficiency_threshold
-            ]
-            ictx.instance_data["evidence_sufficient"] = bool(high_quality)
-        else:
-            ictx.instance_data["evidence_sufficient"] = bool(evidence)
-
+        ictx.instance_data["evidence"] = evidence
+        ictx.instance_data["evidence_sufficient"] = bool(evidence)
+        emit_progress(
+            ctx,
+            tool="read",
+            status="done",
+            count=len(evidence),
+            extra={
+                "route": ictx.instance_data.get("route", ""),
+                "read_modes": sorted({
+                    str(e.get("read_mode", ""))
+                    for e in evidence
+                    if e.get("read_mode")
+                }),
+            },
+        )
         ictx.instance_data["timings"]["read_ms"] = int((time.perf_counter() - t0) * 1000)
         return None
 
@@ -899,8 +721,11 @@ class RagRetrievalWorkflow(Workflow):
                     "query_plan": {
                         "original": ictx.instance_data.get("query", ""),
                         "rewrite": (ictx.instance_data.get("rewrite") or {}).get("rewrite_query", ""),
+                        "doc_query": (ictx.instance_data.get("rewrite") or {}).get("doc_query", ""),
+                        "analysis_query": (ictx.instance_data.get("rewrite") or {}).get("analysis_query", ""),
                         "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
                         "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
+                        "hints": ictx.instance_data.get("hints", {}),
                     },
                     "route": ictx.instance_data.get("route"),
                     "scope_count": ictx.instance_data.get("scope_count", 0),
@@ -955,8 +780,11 @@ class RagRetrievalWorkflow(Workflow):
                     "query_plan": {
                         "original": ictx.instance_data.get("query", ""),
                         "rewrite": (ictx.instance_data.get("rewrite") or {}).get("rewrite_query", ""),
+                        "doc_query": (ictx.instance_data.get("rewrite") or {}).get("doc_query", ""),
+                        "analysis_query": (ictx.instance_data.get("rewrite") or {}).get("analysis_query", ""),
                         "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
                         "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
+                        "hints": ictx.instance_data.get("hints", {}),
                     },
                     "route": ictx.instance_data.get("route"),
                     "scope_count": ictx.instance_data.get("scope_count", 0),

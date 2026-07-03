@@ -77,7 +77,7 @@ class RAGConfig:
     rerank_api_key: str = ""
     rerank_base_url: str = ""
     rerank_top_k: int = 10
-    rerank_threshold: float = 0.3
+    rerank_threshold: float = 0.8
 
     # ── PA-JT 网关鉴权（Embedding/Rerank 共用）──
     pa_jt_open_api_code: str = ""
@@ -165,7 +165,7 @@ def get_rag_config() -> RAGConfig:
         rerank_api_key=os.getenv("RAG_RERANK_API_KEY", os.getenv("API_KEY", "")),
         rerank_base_url=os.getenv("RAG_RERANK_BASE_URL", ""),
         rerank_top_k=int(os.getenv("RAG_RERANK_TOP_K", "10")),
-        rerank_threshold=float(os.getenv("RAG_RERANK_THRESHOLD", "0.3")),
+        rerank_threshold=float(os.getenv("RAG_RERANK_THRESHOLD", "0.7")),
 
         # PA-JT 网关鉴权
         pa_jt_open_api_code=os.getenv("PA_JT_OPEN_API_CODE", ""),

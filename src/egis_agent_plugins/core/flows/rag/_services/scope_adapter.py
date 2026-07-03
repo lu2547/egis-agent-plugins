@@ -56,7 +56,7 @@ class RecallScope:
     tag_ids: list[str] = field(default_factory=list)
     knowledge_ids: list[str] = field(default_factory=list)
     file_names: list[str] = field(default_factory=list)
-    source: str = "flat"
+    source: str = "rag_filter"
 
     def with_extra_knowledge_ids(self, ids: list[str]) -> "RecallScope":
         merged = list(dict.fromkeys([*self.knowledge_ids, *ids]))
@@ -224,41 +224,8 @@ def scope_plan_from_filters_or_context(
     filters: dict[str, Any] | None,
     ctx: dict[str, Any] | None,
 ) -> ScopePlan:
-    """Prefer explicit tool filters, then fallback to runtime context."""
+    """Prefer explicit tool filters, then read runtime context."""
     plan = scope_plan_from_filters(filters)
     if plan.has_scopes:
         return plan
     return scope_plan_from_context(ctx)
-
-
-def scopes_from_flat_filters(
-    *,
-    kb_ids: list[str] | None = None,
-    tag_ids: list[str] | None = None,
-    knowledge_ids: list[str] | None = None,
-    file_names: list[str] | None = None,
-) -> list[RecallScope]:
-    """Convert legacy flat filters to per-KB scopes."""
-    kb_ids = kb_ids or []
-    tag_ids = tag_ids or []
-    knowledge_ids = knowledge_ids or []
-    file_names = file_names or []
-    if kb_ids:
-        return [
-            RecallScope(
-                kb_id=kb_id,
-                tag_ids=list(tag_ids),
-                knowledge_ids=list(knowledge_ids),
-                file_names=list(file_names),
-            )
-            for kb_id in kb_ids
-        ]
-    if tag_ids or knowledge_ids or file_names:
-        return [
-            RecallScope(
-                tag_ids=list(tag_ids),
-                knowledge_ids=list(knowledge_ids),
-                file_names=list(file_names),
-            )
-        ]
-    return []

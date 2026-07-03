@@ -6,21 +6,10 @@ LLM 不感知阶段边界，一次调用拿到 evidence pack。
 继承 ``AgentTool``（非 ``WorkflowTool``），因为 ``WorkflowTool`` 会
 把每个 transition action 暴露给 LLM，而我们希望 LLM 只看到一次 ``run``。
 
-1、	start阶段: 闲聊跳出
-2、rewrite:	查询改写（代词消解、子问题拆分）
-3、route: web / internal / web_unavailable
-recall 阶段:
-  → _milvus_search_with_embedding(top_k=10)
-    → search_across_collections(top_k=10*2=20)
-      → 每个 collection: hybrid_search(top_k=20)
-        → 向量请求 limit=20*2=40
-        → BM25 请求 limit=20*2=40
-        → RRF 融合返回 limit=20
-      → 跨集合 RRF 返回 top_k=20
-rank 阶段:
-  → 取前 30 条送 rerank → MMR 返回 10 条
-evidence 阶段:
-  → 取前 10 条做深度阅读（关联读）chunk < 350 字符、上限1000字符
+1. rewrite/analyze: 判断 direct / rag / web，并接收模型 hints
+2. route: rag 先选文档，再在选中文档内召回 chunk；web 走 web search
+3. rank: rerank + MMR 得到 chunk anchors
+4. read: 小文档全文通读；大文档按 anchor 向下扩展短块
 """
 
 from __future__ import annotations
@@ -30,6 +19,8 @@ import logging
 import time
 import uuid
 from typing import Any
+
+from opentelemetry import trace as otel_trace
 
 from ark_agentic.core.tools.base import AgentTool, ToolParameter
 from ark_agentic.core.types import AgentToolResult, ToolDigest
@@ -100,6 +91,18 @@ class RagTool(AgentTool):
             required=False,
         ),
         ToolParameter(
+            name="hints",
+            type="object",
+            description=(
+                "模型对 RAG 策略的语义判断，workflow 会按该 hint 执行并在 trace 中展示。"
+                "document_match_preference: filename|summary|balanced；"
+                "read_preference: full_document|related_chunks|mixed；"
+                "excluded_file_names: 用户明确要求排除的文件名数组；"
+                "reason: 简短原因。"
+            ),
+            required=False,
+        ),
+        ToolParameter(
             name="max_retries",
             type="integer",
             description="证据不足时的最大重试次数（默认 1）",
@@ -145,7 +148,7 @@ class RagTool(AgentTool):
 
         The frontend scope is request/runtime state, not something the LLM
         should be trusted to synthesize. The after-model callback injects it
-        before tool tracing; this method is the execution-time fallback.
+        before tool tracing; this method also enforces the same contract at execution time.
         """
         rag_state = read_rag_state(ctx)
         raw = rag_state.get("rag_filter") or rag_state.get("rag_filters")
@@ -168,11 +171,10 @@ class RagTool(AgentTool):
             args["filters"] = filters
             return filters
 
-        merged = dict(filters)
-        merged["rag_filter"] = rag_filter
-        args["filters"] = merged
+        filters = {"rag_filter": rag_filter}
+        args["filters"] = filters
         logger.info("[RagRetrieval] injected frontend rag_filter into tool filters: scopes=%d", len(rag_filter))
-        return merged
+        return filters
 
     @staticmethod
     def _parse_int(raw: Any, *, default: int = 0) -> int:
@@ -198,6 +200,56 @@ class RagTool(AgentTool):
                 slim.pop("_workflows", None)
         return slim
 
+    @staticmethod
+    def _doc_trace_item(doc: dict[str, Any]) -> dict[str, Any]:
+        scores = doc.get("document_match_scores") or {}
+        return {
+            "title": doc.get("knowledge_title") or doc.get("file_name") or doc.get("knowledge_id"),
+            "kid": doc.get("knowledge_id", ""),
+            "score": round(float(doc.get("score", 0.0) or 0.0), 4),
+            "filename": round(float(scores.get("filename", 0.0) or 0.0), 4),
+            "summary": round(float(scores.get("summary", 0.0) or 0.0), 4),
+        }
+
+    @classmethod
+    def _set_branch_recall_trace_attrs(cls, span: Any, state_delta: dict[str, Any] | None) -> None:
+        try:
+            data = (
+                (state_delta or {})
+                .get("_workflows", {})
+                .get("rag", {})
+                .get("instances", {})
+            )
+            instance_data = next(iter(data.values())).get("data", {}) if data else {}
+            selected = instance_data.get("selected_documents") or []
+            rejected = instance_data.get("rejected_documents") or []
+            excluded = instance_data.get("excluded_documents") or []
+            span.set_attribute(
+                "rag.doc.strategy",
+                json.dumps(instance_data.get("document_match_strategy") or {}, ensure_ascii=False, default=str),
+            )
+            span.set_attribute(
+                "rag.doc.thresholds",
+                json.dumps(instance_data.get("document_select_thresholds") or {}, ensure_ascii=False, default=str),
+            )
+            span.set_attribute(
+                "rag.doc.selected",
+                json.dumps([cls._doc_trace_item(doc) for doc in selected[:10]], ensure_ascii=False, default=str),
+            )
+            span.set_attribute(
+                "rag.doc.rejected",
+                json.dumps([cls._doc_trace_item(doc) for doc in rejected[:10]], ensure_ascii=False, default=str),
+            )
+            span.set_attribute(
+                "rag.doc.excluded",
+                json.dumps([cls._doc_trace_item(doc) for doc in excluded[:10]], ensure_ascii=False, default=str),
+            )
+            span.set_attribute("rag.doc.selected_count", len(selected))
+            span.set_attribute("rag.doc.rejected_count", len(rejected))
+            span.set_attribute("rag.doc.excluded_count", len(excluded))
+        except Exception:
+            logger.debug("[RagRetrieval] failed to set branch recall trace attrs", exc_info=True)
+
     async def execute(
         self,
         tool_call: Any,
@@ -211,6 +263,7 @@ class RagTool(AgentTool):
         query = args.get("query", "")
         source = args.get("source", "auto")
         filters = self._inject_frontend_filters(args=args, ctx=ctx)
+        hints = self._parse_filters(args.get("hints"))
         max_retries = self._parse_int(args.get("max_retries"), default=1)
 
         if not query.strip():
@@ -244,25 +297,54 @@ class RagTool(AgentTool):
                 else:
                     ctx[key] = value
 
-        async def _step(action: str, step_args: dict[str, Any] | None = None) -> Any:
-            result = await flow.execute(iid, action, step_args or {}, ctx)
-            if result.success:
-                _apply_state_delta(result.state_delta)
-            return result
+        _tracer = otel_trace.get_tracer("egis_rag")
 
-        async def _route_recall_rank() -> Any:
-            """Drive rewritten -> recalled -> ranked, including internal recall."""
-            result = await _step("route")
-            if not result.success or result.new_state == "no_evidence":
+        async def _step(action: str, step_args: dict[str, Any] | None = None) -> Any:
+            with _tracer.start_as_current_span(f"rag.{action}") as span:
+                span.set_attribute("rag.action", action)
+                if step_args:
+                    try:
+                        span.set_attribute("input.value", json.dumps(step_args, ensure_ascii=False, default=str)[:2000])
+                    except Exception:
+                        pass
+                result = await flow.execute(iid, action, step_args or {}, ctx)
+                span.set_attribute("rag.success", result.success)
+                span.set_attribute("rag.new_state", result.new_state or "")
+                if action == "branch_recall":
+                    self._set_branch_recall_trace_attrs(span, result.state_delta)
+                try:
+                    output_payload = {
+                        "success": result.success,
+                        "new_state": result.new_state,
+                        "message": result.message,
+                        "state_delta": result.state_delta,
+                    }
+                    span.set_attribute("output.value", json.dumps(output_payload, ensure_ascii=False, default=str))
+                except Exception:
+                    pass
+                if not result.success:
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, result.digest or "step failed"))
+                else:
+                    _apply_state_delta(result.state_delta)
                 return result
 
-            if result.new_state == "docs_selected":
-                result = await _step("recall")
-                if not result.success:
-                    return result
+        async def _route_recall_rank() -> Any:
+            """Drive rewritten -> routed -> branch_recalled -> recalled -> ranked."""
+            result = await _step("route")
+            if not result.success or result.new_state in ("no_evidence", "no_retrieval"):
+                return result
 
             if result.new_state == "insufficient":
                 return result
+
+            result = await _step("branch_recall")
+            if not result.success or result.new_state in ("no_evidence", "no_retrieval", "insufficient"):
+                return result
+
+            if result.new_state == "branch_recalled":
+                result = await _step("chunk_recall")
+                if not result.success or result.new_state == "insufficient":
+                    return result
 
             return await _step("rank")
 
@@ -277,29 +359,24 @@ class RagTool(AgentTool):
 
             return await _step("decide")
 
-        # ── Step 1: start ──
-        start_args = {
+        # ── Step 1: rewrite/router ──
+        initial_args = {
             "query": query,
             "source": source,
             "filters": filters,
+            "hints": hints,
             "max_retries": max_retries,
         }
-        result = await _step("start", start_args)
+        result = await _step("rewrite", initial_args)
         if not result.success:
             return self._error_result(tool_call.id, result.digest)
 
-        if result.new_state in ("no_retrieval",):
-            return self._no_retrieval_result(tool_call.id, result, ctx)
-
-        # ── Step 2: rewrite ──
-        result = await _step("rewrite")
-        if not result.success:
-            return self._error_result(tool_call.id, result.digest)
-
-        # ── Step 3-5: route → recall → rank → read → decide ──
+        # ── Step 2-6: route → branch_recall → chunk_recall → rank → read → decide ──
         result = await _route_recall_rank()
         if not result.success:
             return self._error_result(tool_call.id, result.digest)
+        if result.new_state == "no_retrieval":
+            return self._no_retrieval_result(tool_call.id, result, ctx)
         if result.new_state == "no_evidence":
             return self._no_evidence_result(tool_call.id, result, ctx)
 
@@ -318,6 +395,8 @@ class RagTool(AgentTool):
             result = await _route_recall_rank()
             if not result.success:
                 return self._error_result(tool_call.id, result.digest)
+            if result.new_state == "no_retrieval":
+                break
             if result.new_state == "no_evidence":
                 break
 

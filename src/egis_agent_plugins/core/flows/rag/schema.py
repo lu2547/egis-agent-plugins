@@ -84,7 +84,7 @@ class Reference:
 class RewriteResult:
     """Query Rewrite 输出的结构化快照。"""
 
-    intent: str = "kb_search"
+    intent: str = "rag"
     keywords: list[str] = field(default_factory=list)
     sub_queries: list[str] = field(default_factory=list)
     rewrite_query: str = ""
@@ -102,6 +102,7 @@ def new_instance_data(
     query: str,
     source: str = "auto",
     filters: dict[str, Any] | None = None,
+    hints: dict[str, Any] | None = None,
     max_retries: int = 1,
 ) -> dict[str, Any]:
     """创建空白 instance_data（``start`` transition 的 effect 调用）。"""
@@ -109,9 +110,10 @@ def new_instance_data(
         "query": query,
         "source": source,
         "filters": filters or {},
+        "hints": hints or {},
         "max_retries": max_retries,
         "rewrite": None,              # RewriteResult.to_dict() | None
-        "route": None,                # "internal" | "web" | "no_retrieval" | "web_unavailable"
+        "route": None,                # "rag" | "web" | "no_retrieval" | "web_unavailable"
         "selected_knowledge_ids": [],
         "candidates": [],             # list[Candidate.to_dict()]
         "ranked": [],                 # list[Candidate.to_dict()]
