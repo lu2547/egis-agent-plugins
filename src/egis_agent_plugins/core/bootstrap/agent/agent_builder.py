@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ class EgisBaseAgent(BaseAgent):
         # egis 额外扫描 core/skills（CORE_SKILLS_DIR env）
         agent_dir = self._agent_dir()
         private_skills_dir = agent_dir / "skills"
+        skill_whitelist = self._load_skill_whitelist()
         # 替代 ark 的 SkillConfig(skill_directories=[...])
         self._skill_config = build_skill_config(  
             self.agent_id,
@@ -56,7 +58,38 @@ class EgisBaseAgent(BaseAgent):
             self.skill_loader.load_from_directories()
         except Exception as exc:
             logger.warning("Failed to load skills for agent '%s': %s", self.agent_id, exc)
+        if skill_whitelist is not None:
+            self._filter_skills_by_whitelist(skill_whitelist)
         self.skill_matcher: SkillMatcher | None = SkillMatcher(self.skill_loader)
+
+    def _load_skill_whitelist(self) -> set[str] | None:
+        agent_json_path = self._agent_dir() / "agent.json"
+        if not agent_json_path.is_file():
+            return None
+        try:
+            data = json.loads(agent_json_path.read_text("utf-8"))
+            skills = data.get("skills")
+            if isinstance(skills, list):
+                return set(skills)
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            pass
+        return None
+
+    def _filter_skills_by_whitelist(self, whitelist: set[str]) -> None:
+        if self.skill_loader is None:
+            return
+        prefix = f"{self.agent_id}."
+        total_before = len(self.skill_loader._skills)
+        for skill_id in list(self.skill_loader._skills):
+            short_name = skill_id[len(prefix):] if skill_id.startswith(prefix) else skill_id
+            if short_name not in whitelist:
+                del self.skill_loader._skills[skill_id]
+                logger.debug("Skill '%s' excluded by whitelist for agent '%s'", skill_id, self.agent_id)
+        total_after = len(self.skill_loader._skills)
+        logger.info(
+            "Skill whitelist applied for agent '%s': %d/%d skills loaded (whitelist=%s)",
+            self.agent_id, total_after, total_before, whitelist,
+        )
 
     # ── ReAct 接线 ──────────────────────────────────────────────────
 
