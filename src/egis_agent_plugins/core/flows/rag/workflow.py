@@ -396,9 +396,15 @@ class RagRetrievalWorkflow(Workflow):
             or rewrite.get("rewrite_query")
             or ictx.instance_data.get("query", "")
         )
+        analysis_query = (
+            rewrite.get("analysis_query")
+            or rewrite.get("rewrite_query")
+            or ictx.instance_data.get("query", "")
+        )
 
         sd_args: dict[str, Any] = {
             "query": doc_query,
+            "summary_query": analysis_query,
             "top_k": int(os.getenv("RAG_DOCUMENT_SELECT_TOP_K", "20")),
             "hints": ictx.instance_data.get("hints") or {},
         }
@@ -411,6 +417,7 @@ class RagRetrievalWorkflow(Workflow):
             status="pending",
             extra={
                 "query": doc_query,
+                "summary_query": analysis_query,
                 "document_match_strategy": {
                     "hints": ictx.instance_data.get("hints") or {},
                 },

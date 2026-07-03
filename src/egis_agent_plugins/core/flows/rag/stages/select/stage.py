@@ -171,9 +171,9 @@ def _format_output(
         match_scores = doc.get("document_match_scores") or {}
         lines.append(
             f"{i}. knowledge_id={kid} kb={kb_id} "
-            f"(final={score:.3f}, filename={float(match_scores.get('filename', 0.0)):.3f}, "
-            f"summary={float(match_scores.get('summary', 0.0)):.3f}, "
-            f"recall={float(match_scores.get('recall', 0.0)):.3f})"
+            f"(final={score:.3f}, filename_initial_recall={float(match_scores.get('filename', 0.0)):.3f}, "
+            f"summary_rerank={float(match_scores.get('summary', 0.0)):.3f}, "
+            f"initial_recall={float(match_scores.get('recall', 0.0)):.3f})"
         )
     lines.append("")
     lines.append("提示: 使用上述 knowledge_ids 调用 knowledge_search 做内容检索")
@@ -222,13 +222,6 @@ def _weights_from_strategy(strategy: dict[str, Any]) -> tuple[float, float]:
     )
 
 
-def _filename_match_text(doc: dict[str, Any]) -> str:
-    title = str(doc.get("knowledge_title") or "").strip()
-    file_name = str(doc.get("file_name") or "").strip()
-    text = " ".join(part for part in (file_name, title) if part)
-    return f"文件名：{text}" if text else ""
-
-
 def _summary_match_text(doc: dict[str, Any]) -> str:
     title = str(doc.get("knowledge_title") or doc.get("file_name") or "").strip()
     content = str(doc.get("content") or "").strip()
@@ -264,12 +257,20 @@ async def _rerank_scores(
         if 0 <= result.index < len(scores):
             scores[result.index] = float(result.score or 0.0)
     logger.info(
-        "[SelectDocuments] rerank_%s query=%s passages=%d accepted=%d scores=%s",
+        "[SelectDocuments] rerank_%s query=%s passages=%d accepted=%d order=%s",
         label,
         query[:80],
         len(passages),
         len(results),
-        [round(s, 4) for s in scores[:10]],
+        [
+            {
+                "idx": int(result.index),
+                "pos": pos,
+                "score": round(float(result.score or 0.0), 4),
+                "text": passages[result.index][:80] if 0 <= result.index < len(passages) else "",
+            }
+            for pos, result in enumerate(results[:10], 1)
+        ],
     )
     return scores
 
@@ -278,6 +279,7 @@ async def _apply_document_strategy(
     *,
     clients: RAGClients,
     query: str,
+    summary_query: str,
     documents: list[dict],
     hints: dict[str, Any],
 ) -> list[dict]:
@@ -286,16 +288,19 @@ async def _apply_document_strategy(
     strategy = _document_match_strategy(hints)
     filename_weight, summary_weight = _weights_from_strategy(strategy)
 
-    filename_passages = [_filename_match_text(doc) for doc in documents]
     summary_passages = [_summary_match_text(doc) for doc in documents]
-    filename_scores, summary_scores = await asyncio.gather(
-        _rerank_scores(clients, query=query, passages=filename_passages, label="filename"),
-        _rerank_scores(clients, query=query, passages=summary_passages, label="summary"),
+    summary_scores = await _rerank_scores(
+        clients,
+        query=summary_query or query,
+        passages=summary_passages,
+        label="summary",
     )
 
-    for doc, name_score, summary_score in zip(documents, filename_scores, summary_scores):
+    for doc, summary_score in zip(documents, summary_scores):
+        name_score = float(doc.get("score", 0.0) or 0.0)
         final_score = filename_weight * name_score + summary_weight * summary_score
         doc["recall_score"] = float(doc.get("score", 0.0) or 0.0)
+        doc["initial_recall_score"] = doc["recall_score"]
         doc["score"] = final_score
         doc["document_match_strategy"] = strategy
         doc["document_match_scores"] = {
@@ -303,7 +308,10 @@ async def _apply_document_strategy(
             "summary": summary_score,
             "final": final_score,
             "recall": doc["recall_score"],
-            "score_source": "rerank",
+            "filename_source": "initial_recall",
+            "summary_source": "rerank",
+            "summary_query": summary_query or query,
+            "score_source": "initial_recall_plus_summary_rerank",
         }
     return sorted(documents, key=lambda d: float(d.get("score", 0.0)), reverse=True)
 
@@ -337,6 +345,7 @@ def _shortlist_documents(
         "relative_to_best": relative_to_best,
         "best_score": best_score,
         "cutoff": cutoff,
+        "score_source": "initial_recall_plus_summary_rerank",
     }
     return selected, rejected, thresholds
 
@@ -384,7 +393,9 @@ def _doc_log_item(doc: dict[str, Any]) -> dict[str, Any]:
         "score": round(float(doc.get("score", 0.0) or 0.0), 4),
         "filename": round(float(scores.get("filename", 0.0) or 0.0), 4),
         "summary": round(float(scores.get("summary", 0.0) or 0.0), 4),
-        "recall": round(float(scores.get("recall", 0.0) or 0.0), 4),
+        "initial_recall": round(float(scores.get("recall", 0.0) or 0.0), 4),
+        "filename_source": scores.get("filename_source", ""),
+        "summary_source": scores.get("summary_source", ""),
         "score_source": scores.get("score_source", ""),
     }
 
@@ -423,6 +434,7 @@ async def run(
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query 参数不能为空"}
+    summary_query = (args.get("summary_query") or args.get("analysis_query") or query).strip()
     hints = args.get("hints") if isinstance(args.get("hints"), dict) else {}
     document_match_strategy = _document_match_strategy(hints)
 
@@ -521,6 +533,7 @@ async def run(
         documents = await _apply_document_strategy(
             clients=clients,
             query=query,
+            summary_query=summary_query,
             documents=documents,
             hints=hints,
         )
