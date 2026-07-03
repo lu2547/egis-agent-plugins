@@ -217,6 +217,8 @@ class MilvusClient:
         output_fields: list[str] | None = None,
         vector_weight: float = 0.7,
         keywords_weight: float = 0.3,
+        hybrid_ranker: str = "weighted",
+        rrf_k: int = 60,
     ) -> list[MilvusSearchResult]:
         """执行搜索（统一入口）
 
@@ -229,6 +231,8 @@ class MilvusClient:
             output_fields: 可选，输出字段列表（默认 OUTPUT_FIELDS）。
             vector_weight: 混合检索中的向量权重，默认 0.7。
             keywords_weight: 混合检索中的 BM25 权重，默认 0.3。
+            hybrid_ranker: hybrid_search 融合方式，weighted 或 rrf。
+            rrf_k: 使用 RRF 时的 k 值。
         """
         if isinstance(retriever_type, str):
             retriever_type = RetrieverType(retriever_type)
@@ -289,6 +293,8 @@ class MilvusClient:
                 top_k=top_k,
                 vector_weight=vector_weight,
                 keywords_weight=keywords_weight,
+                hybrid_ranker=hybrid_ranker,
+                rrf_k=rrf_k,
                 output_fields=output_fields,
             )
 
@@ -482,6 +488,8 @@ class MilvusClient:
         top_k: int,
         vector_weight: float = 0.7,
         keywords_weight: float = 0.3,
+        hybrid_ranker: str = "weighted",
+        rrf_k: int = 60,
         output_fields: list[str] | None = None,
     ) -> list[MilvusSearchResult]:
         """在指定 collection 上执行混合检索（Milvus 原生 hybrid_search）。
@@ -490,8 +498,8 @@ class MilvusClient:
         ``AnnSearchRequest`` 一次 RPC 在服务端完成检索与加权融合，
         避免客户端两次往返再手写融合。
 
-        默认内容检索使用向量 0.7 / BM25 0.3；调用方可以覆盖权重，
-        例如文档选择更偏关键词时使用向量 0.3 / BM25 0.7。
+        默认内容检索使用 WeightedRanker，调用方也可以指定 ``hybrid_ranker="rrf"``
+        使用 Milvus 原生 RRFRanker。
         """
         self.ensure_collection_loaded(collection_name)
 
@@ -515,14 +523,15 @@ class MilvusClient:
                 expr=filter_expr,
             )
 
-            ranker = (
-                WeightedRanker(vector_weight, keywords_weight)
-                if WeightedRanker is not None
-                else RRFRanker(60)
-            )
-            if WeightedRanker is None:
+            if (hybrid_ranker or "").lower() == "rrf":
+                ranker = RRFRanker(rrf_k)
+            elif WeightedRanker is not None:
+                ranker = WeightedRanker(vector_weight, keywords_weight)
+            else:
+                ranker = RRFRanker(rrf_k)
                 logger.warning(
-                    "[Milvus] WeightedRanker unavailable; fallback to RRFRanker(60)"
+                    "[Milvus] WeightedRanker unavailable; fallback to RRFRanker(%d)",
+                    rrf_k,
                 )
 
             res = self.client.hybrid_search(

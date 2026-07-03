@@ -210,6 +210,7 @@ class RagTool(AgentTool):
             "filename": round(float(scores.get("filename", 0.0) or 0.0), 4),
             "summary": round(float(scores.get("summary", 0.0) or 0.0), 4),
             "initial_recall": round(float(scores.get("recall", 0.0) or 0.0), 4),
+            "initial_recall_components": doc.get("initial_recall_components", {}),
             "filename_source": scores.get("filename_source", ""),
             "summary_source": scores.get("summary_source", ""),
             "score_source": scores.get("score_source", ""),

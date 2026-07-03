@@ -459,6 +459,7 @@ class RagRetrievalWorkflow(Workflow):
                         "knowledge_id": doc.get("knowledge_id", ""),
                         "title": doc.get("knowledge_title") or doc.get("file_name", ""),
                         "score": doc.get("score", 0.0),
+                        "initial_recall_components": doc.get("initial_recall_components", {}),
                         "document_match_scores": doc.get("document_match_scores", {}),
                     }
                     for doc in result.get("documents", [])[:8]
@@ -468,6 +469,7 @@ class RagRetrievalWorkflow(Workflow):
                         "knowledge_id": doc.get("knowledge_id", ""),
                         "title": doc.get("knowledge_title") or doc.get("file_name", ""),
                         "score": doc.get("score", 0.0),
+                        "initial_recall_components": doc.get("initial_recall_components", {}),
                         "document_match_scores": doc.get("document_match_scores", {}),
                     }
                     for doc in result.get("rejected_documents", [])[:8]

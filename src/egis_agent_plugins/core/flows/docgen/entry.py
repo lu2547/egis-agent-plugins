@@ -393,7 +393,7 @@ async def _ef_select_ppt(ictx: InstanceCtx) -> EffectOutput | None:
         },
     )
     return EffectOutput(
-        message="用户选择了 AI PPT 制作。请按 pptmaster 技能执行。",
+        message="用户选择了 AI PPT 制作。请调用 consult_ppt_agent 委派 PPT 制作助手完成。",
         extras={
             **state_delta,
             "docgen_state.mode": "ai",

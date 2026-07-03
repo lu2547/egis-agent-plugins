@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from typing import Any
+
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from egis_agent_plugins.core.flows.rag.clients import RAGClients
 from egis_agent_plugins.core.flows.rag._services.scope_adapter import (
@@ -23,6 +26,7 @@ from egis_agent_plugins.core.flows.rag.filters import (
 from egis_agent_plugins.core.service.base import MilvusSearchResult, RetrieverType
 
 logger = logging.getLogger(__name__)
+_filename_score_llm: Any | None = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -171,9 +175,9 @@ def _format_output(
         match_scores = doc.get("document_match_scores") or {}
         lines.append(
             f"{i}. knowledge_id={kid} kb={kb_id} "
-            f"(final={score:.3f}, filename_initial_recall={float(match_scores.get('filename', 0.0)):.3f}, "
+            f"(final={score:.3f}, filename_llm={float(match_scores.get('filename', 0.0)):.3f}, "
             f"summary_rerank={float(match_scores.get('summary', 0.0)):.3f}, "
-            f"initial_recall={float(match_scores.get('recall', 0.0)):.3f})"
+            f"initial_rrf={float(match_scores.get('recall', 0.0)):.3f})"
         )
     lines.append("")
     lines.append("提示: 使用上述 knowledge_ids 调用 knowledge_search 做内容检索")
@@ -222,6 +226,12 @@ def _weights_from_strategy(strategy: dict[str, Any]) -> tuple[float, float]:
     )
 
 
+def _filename_match_text(doc: dict[str, Any]) -> str:
+    file_name = str(doc.get("file_name") or doc.get("knowledge_title") or "").strip()
+    stem, _ = os.path.splitext(file_name)
+    return (stem or file_name).strip()
+
+
 def _summary_match_text(doc: dict[str, Any]) -> str:
     title = str(doc.get("knowledge_title") or doc.get("file_name") or "").strip()
     content = str(doc.get("content") or "").strip()
@@ -230,6 +240,97 @@ def _summary_match_text(doc: dict[str, Any]) -> str:
     if content:
         return f"摘要：{content}"
     return f"文档：{title}" if title else ""
+
+
+def _get_filename_score_llm() -> Any:
+    global _filename_score_llm
+    if _filename_score_llm is None:
+        from ark_agentic.core.llm import create_chat_model_from_env
+
+        _filename_score_llm = create_chat_model_from_env()
+    return _filename_score_llm
+
+
+def _parse_filename_score_response(raw: str, count: int) -> list[float]:
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+    if raw.endswith("```"):
+        raw = raw.rsplit("```", 1)[0]
+    data = json.loads(raw.strip())
+    if isinstance(data, dict):
+        data = data.get("scores", [])
+    if not isinstance(data, list):
+        raise ValueError("filename score response must be a list")
+
+    scores = [0.0 for _ in range(count)]
+    seen: set[int] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx = int(item.get("index", -1))
+        if idx < 0 or idx >= count:
+            continue
+        score = float(item.get("score", 0.0))
+        scores[idx] = max(0.0, min(1.0, score))
+        seen.add(idx)
+    if len(seen) != count:
+        raise ValueError(f"filename score response missing indexes: expected={count}, got={len(seen)}")
+    return scores
+
+
+async def _llm_filename_scores(
+    *,
+    query: str,
+    filenames: list[str],
+) -> list[float]:
+    if not filenames:
+        return []
+
+    items = [
+        {"index": i, "passage": filename}
+        for i, filename in enumerate(filenames)
+    ]
+    system = (
+        "你是文档文件名语义相似度评分器。"
+        "只判断 query 与 passage 是否指向同一类/同一份/同一主题文档。"
+        "忽略文件后缀、年份/年度只作为区分信息；不要判断 passage 能否回答业务问题。"
+        "输出 0 到 1 的分数，1 表示高度匹配，0 表示完全不相关。"
+        "必须只输出 JSON，不要解释。格式："
+        '{"scores":[{"index":0,"score":0.0}]}'
+    )
+    user = json.dumps(
+        {
+            "query": query,
+            "items": items,
+        },
+        ensure_ascii=False,
+    )
+
+    timeout = float(os.getenv("RAG_DOCUMENT_FILENAME_SCORE_TIMEOUT_S", "8"))
+    llm = _get_filename_score_llm()
+    response = await asyncio.wait_for(
+        llm.ainvoke(
+            [
+                SystemMessage(content=system),
+                HumanMessage(content=user),
+            ],
+            temperature=0,
+            max_tokens=min(1500, max(300, len(filenames) * 80)),
+        ),
+        timeout=timeout,
+    )
+    raw = response.content.strip() if response.content else ""
+    scores = _parse_filename_score_response(raw, len(filenames))
+    logger.info(
+        "[SelectDocuments] filename_llm_score query=%s items=%s",
+        query[:80],
+        [
+            {"idx": i, "score": round(score, 4), "passage": filename[:80]}
+            for i, (filename, score) in enumerate(zip(filenames, scores))
+        ][:10],
+    )
+    return scores
 
 
 async def _rerank_scores(
@@ -288,16 +389,24 @@ async def _apply_document_strategy(
     strategy = _document_match_strategy(hints)
     filename_weight, summary_weight = _weights_from_strategy(strategy)
 
+    filename_passages = [_filename_match_text(doc) for doc in documents]
     summary_passages = [_summary_match_text(doc) for doc in documents]
-    summary_scores = await _rerank_scores(
-        clients,
-        query=summary_query or query,
-        passages=summary_passages,
-        label="summary",
+    filename_scores, summary_scores = await asyncio.gather(
+        _llm_filename_scores(query=query, filenames=filename_passages),
+        _rerank_scores(
+            clients,
+            query=summary_query or query,
+            passages=summary_passages,
+            label="summary",
+        ),
     )
 
-    for doc, summary_score in zip(documents, summary_scores):
-        name_score = float(doc.get("score", 0.0) or 0.0)
+    for doc, filename_text, name_score, summary_score in zip(
+        documents,
+        filename_passages,
+        filename_scores,
+        summary_scores,
+    ):
         final_score = filename_weight * name_score + summary_weight * summary_score
         doc["recall_score"] = float(doc.get("score", 0.0) or 0.0)
         doc["initial_recall_score"] = doc["recall_score"]
@@ -308,10 +417,12 @@ async def _apply_document_strategy(
             "summary": summary_score,
             "final": final_score,
             "recall": doc["recall_score"],
-            "filename_source": "initial_recall",
+            "filename_source": "llm_similarity",
+            "filename_query": query,
+            "filename_passage": filename_text,
             "summary_source": "rerank",
             "summary_query": summary_query or query,
-            "score_source": "initial_recall_plus_summary_rerank",
+            "score_source": "llm_filename_plus_summary_rerank",
         }
     return sorted(documents, key=lambda d: float(d.get("score", 0.0)), reverse=True)
 
@@ -345,7 +456,8 @@ def _shortlist_documents(
         "relative_to_best": relative_to_best,
         "best_score": best_score,
         "cutoff": cutoff,
-        "score_source": "initial_recall_plus_summary_rerank",
+        "recall_source": "summary_milvus_rrf",
+        "score_source": "llm_filename_plus_summary_rerank",
     }
     return selected, rejected, thresholds
 
@@ -394,6 +506,7 @@ def _doc_log_item(doc: dict[str, Any]) -> dict[str, Any]:
         "filename": round(float(scores.get("filename", 0.0) or 0.0), 4),
         "summary": round(float(scores.get("summary", 0.0) or 0.0), 4),
         "initial_recall": round(float(scores.get("recall", 0.0) or 0.0), 4),
+        "initial_recall_components": doc.get("initial_recall_components", {}),
         "filename_source": scores.get("filename_source", ""),
         "summary_source": scores.get("summary_source", ""),
         "score_source": scores.get("score_source", ""),
@@ -476,8 +589,7 @@ async def run(
         clients.milvus.ensure_collection_loaded(summary_collection)
 
         _t_milvus = time.perf_counter()
-        vector_weight = float(os.getenv("RAG_DOC_SELECT_VECTOR_WEIGHT", "0.3"))
-        keywords_weight = float(os.getenv("RAG_DOC_SELECT_BM25_WEIGHT", "0.7"))
+        rrf_k = int(os.getenv("RAG_DOCUMENT_SELECT_RRF_K", "60"))
 
         sem = asyncio.Semaphore(int(os.getenv("RAG_SCOPE_SELECT_CONCURRENCY", "3")))
 
@@ -493,25 +605,27 @@ async def run(
                     filter_expr=filter_expr,
                     top_k=top_k,
                     output_fields=SUMMARY_OUTPUT_FIELDS,
-                    vector_weight=vector_weight,
-                    keywords_weight=keywords_weight,
+                    hybrid_ranker="rrf",
+                    rrf_k=rrf_k,
                 )
             docs = _documents_from_search_results(search_results)
-            search_mode = "hybrid"
             for doc in docs:
+                doc["initial_recall_components"] = {
+                    "hybrid_ranker": "rrf",
+                    "rrf_k": rrf_k,
+                    "score": float(doc.get("score", 0.0) or 0.0),
+                }
                 doc["scope"] = {
                     "kb_id": scope.kb_id,
                     "kb_name": scope.kb_name,
                     "source": scope.source,
                 }
             logger.info(
-                "[SelectDocuments] scope=%s mode=%s docs=%d filter=%s weights=bm25:%.2f,vector:%.2f",
+                "[SelectDocuments] scope=%s mode=hybrid_rrf docs=%d filter=%s rrf_k=%d",
                 scope.kb_id or "*",
-                search_mode,
                 len(docs),
                 filter_expr,
-                keywords_weight,
-                vector_weight,
+                rrf_k,
             )
             return docs
 
