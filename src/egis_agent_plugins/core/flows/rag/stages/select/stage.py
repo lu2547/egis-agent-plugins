@@ -172,7 +172,8 @@ def _format_output(
         lines.append(
             f"{i}. knowledge_id={kid} kb={kb_id} "
             f"(final={score:.3f}, filename={float(match_scores.get('filename', 0.0)):.3f}, "
-            f"summary={float(match_scores.get('summary', 0.0)):.3f})"
+            f"summary={float(match_scores.get('summary', 0.0)):.3f}, "
+            f"recall={float(match_scores.get('recall', 0.0)):.3f})"
         )
     lines.append("")
     lines.append("提示: 使用上述 knowledge_ids 调用 knowledge_search 做内容检索")
@@ -189,23 +190,6 @@ def _dedup_documents(documents: list[dict]) -> list[dict]:
         seen.add(kid)
         out.append(doc)
     return out
-
-
-def _filename_score(query: str, doc: dict) -> float:
-    target = " ".join(
-        str(doc.get(key) or "")
-        for key in ("file_name", "knowledge_title")
-    ).lower()
-    q = (query or "").lower()
-    if not q or not target:
-        return 0.0
-    if target and target in q:
-        return 1.0
-    query_terms = {part for part in q.replace("《", " ").replace("》", " ").replace(".", " ").split() if part}
-    if not query_terms:
-        return 0.0
-    hits = sum(1 for term in query_terms if term and term in target)
-    return min(1.0, hits / max(1, len(query_terms)))
 
 
 def _document_match_strategy(hints: dict[str, Any]) -> dict[str, Any]:
@@ -238,8 +222,61 @@ def _weights_from_strategy(strategy: dict[str, Any]) -> tuple[float, float]:
     )
 
 
-def _apply_document_strategy(
+def _filename_match_text(doc: dict[str, Any]) -> str:
+    title = str(doc.get("knowledge_title") or "").strip()
+    file_name = str(doc.get("file_name") or "").strip()
+    text = " ".join(part for part in (file_name, title) if part)
+    return f"文件名：{text}" if text else ""
+
+
+def _summary_match_text(doc: dict[str, Any]) -> str:
+    title = str(doc.get("knowledge_title") or doc.get("file_name") or "").strip()
+    content = str(doc.get("content") or "").strip()
+    if title and content:
+        return f"文档：{title}\n摘要：{content}"
+    if content:
+        return f"摘要：{content}"
+    return f"文档：{title}" if title else ""
+
+
+async def _rerank_scores(
+    clients: RAGClients,
     *,
+    query: str,
+    passages: list[str],
+    label: str,
+) -> list[float]:
+    if not clients.rerank or not clients.rerank.enabled:
+        raise RuntimeError("文档选择需要 rerank，但 rerank 未配置")
+
+    timeout = float(os.getenv("RAG_DOCUMENT_SELECT_RERANK_TIMEOUT_S", "8"))
+    results = await asyncio.wait_for(
+        clients.rerank.rerank(
+            query,
+            passages,
+            top_k=len(passages),
+            apply_threshold=False,
+        ),
+        timeout=timeout,
+    )
+    scores = [0.0 for _ in passages]
+    for result in results:
+        if 0 <= result.index < len(scores):
+            scores[result.index] = float(result.score or 0.0)
+    logger.info(
+        "[SelectDocuments] rerank_%s query=%s passages=%d accepted=%d scores=%s",
+        label,
+        query[:80],
+        len(passages),
+        len(results),
+        [round(s, 4) for s in scores[:10]],
+    )
+    return scores
+
+
+async def _apply_document_strategy(
+    *,
+    clients: RAGClients,
     query: str,
     documents: list[dict],
     hints: dict[str, Any],
@@ -248,19 +285,25 @@ def _apply_document_strategy(
         return documents
     strategy = _document_match_strategy(hints)
     filename_weight, summary_weight = _weights_from_strategy(strategy)
-    max_summary = max(float(doc.get("score", 0.0) or 0.0) for doc in documents) or 1.0
-    for doc in documents:
-        summary_score = float(doc.get("score", 0.0) or 0.0) / max_summary
-        name_score = _filename_score(query, doc)
+
+    filename_passages = [_filename_match_text(doc) for doc in documents]
+    summary_passages = [_summary_match_text(doc) for doc in documents]
+    filename_scores, summary_scores = await asyncio.gather(
+        _rerank_scores(clients, query=query, passages=filename_passages, label="filename"),
+        _rerank_scores(clients, query=query, passages=summary_passages, label="summary"),
+    )
+
+    for doc, name_score, summary_score in zip(documents, filename_scores, summary_scores):
         final_score = filename_weight * name_score + summary_weight * summary_score
-        doc["filename_score"] = name_score
-        doc["summary_score"] = summary_score
+        doc["recall_score"] = float(doc.get("score", 0.0) or 0.0)
         doc["score"] = final_score
         doc["document_match_strategy"] = strategy
         doc["document_match_scores"] = {
             "filename": name_score,
             "summary": summary_score,
             "final": final_score,
+            "recall": doc["recall_score"],
+            "score_source": "rerank",
         }
     return sorted(documents, key=lambda d: float(d.get("score", 0.0)), reverse=True)
 
@@ -341,6 +384,8 @@ def _doc_log_item(doc: dict[str, Any]) -> dict[str, Any]:
         "score": round(float(doc.get("score", 0.0) or 0.0), 4),
         "filename": round(float(scores.get("filename", 0.0) or 0.0), 4),
         "summary": round(float(scores.get("summary", 0.0) or 0.0), 4),
+        "recall": round(float(scores.get("recall", 0.0) or 0.0), 4),
+        "score_source": scores.get("score_source", ""),
     }
 
 
@@ -473,7 +518,12 @@ async def run(
         documents = _dedup_documents(documents)
         await _fill_document_titles(clients, documents)
         documents, excluded_by_hint = _apply_excluded_files(documents, hints)
-        documents = _apply_document_strategy(query=query, documents=documents, hints=hints)
+        documents = await _apply_document_strategy(
+            clients=clients,
+            query=query,
+            documents=documents,
+            hints=hints,
+        )
         selected_documents, rejected_documents, select_thresholds = _shortlist_documents(documents)
         logger.info(
             "[SelectDocuments] strategy=%s thresholds=%s candidates=%d selected=%d rejected=%d excluded=%d selected=%s rejected=%s excluded_docs=%s",

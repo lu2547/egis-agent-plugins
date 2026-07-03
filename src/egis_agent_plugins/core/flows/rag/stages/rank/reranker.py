@@ -97,12 +97,13 @@ class Rerank:
         passages: list[str],
         *,
         top_k: int | None = None,
+        apply_threshold: bool = True,
     ) -> list[RerankResult]:
         """对 ``passages`` 执行 rerank（严格模式）。
 
         - 未启用 → 返原序（score=1.0，让上层下游逻辑无感切换）
         - 启用但空输入 → 返 ``[]``
-        - 启用且调用成功 → 阈值过滤后返回
+        - 启用且调用成功 → 默认阈值过滤后返回；``apply_threshold=False`` 时返回原始 rerank 分
         - 启用但调用失败 → raise ``RerankError``
         """
         if not self.enabled:
@@ -153,7 +154,7 @@ class Rerank:
             f"input={len(doc_texts)} → output={len(results)}"
         )
 
-        return self._apply_threshold(results)
+        return self._apply_threshold(results) if apply_threshold else results
 
     # ── 内部实现 ──
 
