@@ -439,9 +439,9 @@ def _shortlist_documents(
             "best_score": 0.0,
         }
 
-    max_documents = max(1, int(os.getenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "6")))
+    max_documents = max(1, int(os.getenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "3")))
     min_score = float(os.getenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0.15"))
-    relative_to_best = float(os.getenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.55"))
+    relative_to_best = float(os.getenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.85"))
     best_score = max(float(doc.get("score", 0.0) or 0.0) for doc in documents)
     cutoff = max(min_score, best_score * relative_to_best)
 

@@ -50,10 +50,21 @@ from .stages.rewrite.stage import run as _rewrite_run
 from .stages.select.stage import run as _select_run
 
 # 前端 rag_state 硬覆盖过滤器
-from egis_agent_plugins.core.flows.rag._services.document_reader import read_ranked_context
+from egis_agent_plugins.core.flows.rag._services.document_reader import (
+    read_ranked_context,
+    read_selected_documents_context,
+)
 from egis_agent_plugins.core.flows.rag._services.scope_adapter import read_rag_state
 
 logger = logging.getLogger(__name__)
+
+
+def _document_read_mode() -> str:
+    mode = (os.getenv("RAG_DOCUMENT_READ_MODE") or "global_chunk_rerank").strip()
+    if mode not in {"global_chunk_rerank", "per_document_read"}:
+        logger.warning("[RAG WF] unknown RAG_DOCUMENT_READ_MODE=%s, using global_chunk_rerank", mode)
+        return "global_chunk_rerank"
+    return mode
 
 
 # ── Scope helpers ──────────────────────────────────────────────────────────
@@ -446,6 +457,7 @@ class RagRetrievalWorkflow(Workflow):
         ictx.instance_data["document_select_thresholds"] = result.get("document_select_thresholds") or {}
         ictx.instance_data["rejected_documents"] = result.get("rejected_documents") or []
         ictx.instance_data["excluded_documents"] = result.get("excluded_documents") or []
+        ictx.instance_data["document_read_mode"] = _document_read_mode()
         ictx.instance_data["candidates"] = []
         emit_progress(
             ctx,
@@ -484,6 +496,7 @@ class RagRetrievalWorkflow(Workflow):
                 ],
                 "document_match_strategy": result.get("document_match_strategy") or {},
                 "document_select_thresholds": result.get("document_select_thresholds") or {},
+                "document_read_mode": ictx.instance_data["document_read_mode"],
             },
         )
         logger.info("[RAG WF] rag → selected docs=%d; recall chunks next", len(kid_list))
@@ -492,7 +505,208 @@ class RagRetrievalWorkflow(Workflow):
 
     async def _ef_chunk_recall_rag(self, ictx: InstanceCtx) -> EffectOutput | None:
         """RAG chunk recall — search chunks inside selected documents."""
+        if ictx.instance_data.get("document_read_mode") == "per_document_read":
+            await self._ef_per_document_recall_rank(ictx)
+            return None
         await self._ef_recall_scoped(ictx)
+        return None
+
+    def _rag_queries(self, ictx: InstanceCtx) -> list[str]:
+        rewrite = ictx.instance_data.get("rewrite") or {}
+        query = rewrite.get("rewrite_query") or ictx.instance_data.get("query", "")
+        sub_queries = rewrite.get("sub_queries", [])
+
+        original_query = ictx.instance_data.get("query", "")
+        queries = [query] if query else []
+        if original_query and original_query not in queries:
+            queries.append(original_query)
+        for sq in sub_queries:
+            if sq and sq not in queries:
+                queries.append(sq)
+        return queries[:5]
+
+    async def _ef_per_document_recall_rank(self, ictx: InstanceCtx) -> EffectOutput | None:
+        """Per-document read mode: small docs read later, large docs recall/rank per file."""
+        t0 = time.perf_counter()
+        ctx = ictx.session_ctx
+        selected_documents = ictx.instance_data.get("selected_documents") or []
+        queries = self._rag_queries(ictx)
+        if not selected_documents or not queries:
+            ictx.instance_data["candidates"] = []
+            ictx.instance_data["per_document_ranked_anchors"] = []
+            return None
+
+        pg = getattr(self._clients, "postgres", None)
+        if pg is None:
+            ictx.instance_data["candidates"] = []
+            ictx.instance_data["per_document_ranked_anchors"] = []
+            return None
+        await pg.connect()
+
+        selected_ids = [
+            str(doc.get("knowledge_id", "")).strip()
+            for doc in selected_documents
+            if str(doc.get("knowledge_id", "")).strip()
+        ]
+        count_results = await asyncio.gather(
+            *(pg.get_chunk_count_by_knowledge_id(kid) for kid in selected_ids),
+            return_exceptions=True,
+        )
+        chunk_counts: dict[str, int] = {}
+        for kid, count in zip(selected_ids, count_results):
+            if isinstance(count, Exception):
+                logger.warning("[RAG WF] per-document count failed kid=%s: %s", kid, count)
+                continue
+            chunk_counts[kid] = int(count or 0)
+
+        small_limit = int(os.getenv("RAG_SMALL_DOC_CHUNK_LIMIT", "50"))
+        read_plan: list[dict[str, Any]] = []
+        large_documents: list[dict[str, Any]] = []
+        marker_candidates: list[dict[str, Any]] = []
+        for doc in selected_documents:
+            kid = str(doc.get("knowledge_id", "")).strip()
+            if not kid:
+                continue
+            chunk_count = chunk_counts.get(kid, 0)
+            is_small = 0 < chunk_count < small_limit
+            read_mode = "small_doc_full" if is_small else "large_doc_expand"
+            plan_item = {
+                "knowledge_id": kid,
+                "file_name": doc.get("knowledge_title") or doc.get("file_name") or "",
+                "score": doc.get("score", 0.0),
+                "document_match_scores": doc.get("document_match_scores", {}),
+                "chunk_count": chunk_count,
+                "read_mode": read_mode,
+            }
+            read_plan.append(plan_item)
+            if is_small:
+                marker_candidates.append({
+                    "id": f"doc_marker:{kid}",
+                    "content": "",
+                    "chunk_id": f"doc_marker:{kid}",
+                    "knowledge_id": kid,
+                    "knowledge_base_id": doc.get("knowledge_base_id", ""),
+                    "score": float(doc.get("score", 0.0) or 0.0),
+                    "knowledge_title": doc.get("knowledge_title") or doc.get("file_name", ""),
+                    "chunk_index": 0,
+                    "source": "document_marker",
+                    "source_query": queries[0],
+                    "query_type": "document_marker",
+                })
+            else:
+                large_documents.append(doc)
+
+        emit_progress(
+            ctx,
+            tool="knowledge_search",
+            status="pending",
+            extra={
+                "document_read_mode": "per_document_read",
+                "selected_docs": len(selected_documents),
+                "small_docs": len(marker_candidates),
+                "large_docs": len(large_documents),
+            },
+        )
+
+        sem = asyncio.Semaphore(int(os.getenv("RAG_PER_DOC_RECALL_CONCURRENCY", "3")))
+        per_doc_recall_top_k = int(os.getenv("RAG_PER_DOC_CHUNK_RECALL_TOP_K", "40"))
+        per_doc_rank_top_k = int(os.getenv("RAG_PER_DOC_CHUNK_RERANK_TOP_K", "10"))
+        filters = ictx.instance_data.get("filters") or {}
+
+        async def _recall_rank_one(doc: dict[str, Any]) -> list[dict[str, Any]]:
+            kid = str(doc.get("knowledge_id", "")).strip()
+            if not kid:
+                return []
+            args: dict[str, Any] = {
+                "queries": queries,
+                "knowledge_ids": [kid],
+                "selected_documents": [doc],
+            }
+            if filters.get("rag_filter"):
+                args["rag_filter"] = filters["rag_filter"]
+            async with sem:
+                recall_result = await _recall_run(
+                    clients=self._clients,
+                    args=args,
+                    ctx=ctx,
+                    top_k=per_doc_recall_top_k,
+                )
+                raw_results = recall_result.get("results", [])
+                candidates = [
+                    Candidate(
+                        id=sr.get("id", ""),
+                        content=sr.get("content", ""),
+                        chunk_id=sr.get("chunk_id", ""),
+                        knowledge_id=sr.get("knowledge_id", ""),
+                        knowledge_base_id=sr.get("knowledge_base_id", ""),
+                        score=float(sr.get("score", 0.0)),
+                        knowledge_title=sr.get("knowledge_title", ""),
+                        chunk_index=sr.get("chunk_index", 0),
+                        source="internal",
+                        source_query=sr.get("source_query", queries[0]),
+                        query_type=sr.get("query_type", "hybrid"),
+                    ).to_dict()
+                    for sr in raw_results
+                    if sr.get("knowledge_id") == kid
+                ]
+                if not candidates:
+                    return []
+                rank_query = (
+                    (ictx.instance_data.get("rewrite") or {}).get("analysis_query")
+                    or (ictx.instance_data.get("rewrite") or {}).get("rewrite_query")
+                    or ictx.instance_data.get("query", "")
+                )
+                rank_result = await _rank_run(
+                    clients=self._clients,
+                    args={
+                        "candidates": candidates,
+                        "queries": [rank_query] if rank_query else queries,
+                        "top_k": per_doc_rank_top_k,
+                    },
+                    ctx=ctx,
+                )
+                ranked = rank_result.get("ranked", [])
+                for item in ranked:
+                    item["document_score"] = float(doc.get("score", 0.0) or 0.0)
+                    item["document_match_scores"] = doc.get("document_match_scores", {})
+                    item["document_read_mode"] = "per_document_read"
+                logger.info(
+                    "[RAG WF] per-doc recall/rank kid=%s candidates=%d ranked=%d",
+                    kid,
+                    len(candidates),
+                    len(ranked),
+                )
+                return ranked
+
+        ranked_groups = await asyncio.gather(
+            *(_recall_rank_one(doc) for doc in large_documents),
+            return_exceptions=True,
+        )
+        ranked_anchors: list[dict[str, Any]] = []
+        for result in ranked_groups:
+            if isinstance(result, Exception):
+                logger.warning("[RAG WF] per-document recall/rank failed: %s", result)
+                continue
+            ranked_anchors.extend(result)
+
+        ictx.instance_data["document_read_plan"] = read_plan
+        ictx.instance_data["per_document_ranked_anchors"] = ranked_anchors
+        ictx.instance_data["candidates"] = ranked_anchors or marker_candidates
+        if ranked_anchors:
+            ictx.instance_data["scope_count"] = len(selected_documents)
+
+        emit_progress(
+            ctx,
+            tool="knowledge_search",
+            status="done",
+            count=len(ranked_anchors),
+            extra={
+                "document_read_mode": "per_document_read",
+                "document_read_plan": read_plan,
+                "large_anchor_count": len(ranked_anchors),
+            },
+        )
+        ictx.instance_data["timings"]["recall_ms"] = int((time.perf_counter() - t0) * 1000)
         return None
 
     async def _ef_recall_scoped(self, ictx: InstanceCtx) -> EffectOutput | None:
@@ -588,6 +802,23 @@ class RagRetrievalWorkflow(Workflow):
     async def _ef_fusion_rerank_mmr(self, ictx: InstanceCtx) -> EffectOutput | None:
         """Rank phase — rerank, threshold, and MMR order candidates."""
         t0 = time.perf_counter()
+        if ictx.instance_data.get("document_read_mode") == "per_document_read":
+            ranked = ictx.instance_data.get("per_document_ranked_anchors") or []
+            ictx.instance_data["ranked"] = ranked
+            emit_progress(
+                ictx.session_ctx,
+                tool="rank",
+                status="done",
+                count=len(ranked),
+                extra={
+                    "document_read_mode": "per_document_read",
+                    "rank_scope": "per_document",
+                    "document_read_plan": ictx.instance_data.get("document_read_plan", []),
+                },
+            )
+            ictx.instance_data["timings"]["rank_ms"] = int((time.perf_counter() - t0) * 1000)
+            return None
+
         candidates = ictx.instance_data.get("candidates") or []
         rewrite = ictx.instance_data.get("rewrite") or {}
         query = (
@@ -631,16 +862,27 @@ class RagRetrievalWorkflow(Workflow):
         ctx = ictx.session_ctx
         ranked = ictx.instance_data.get("ranked") or []
 
-        if not ranked:
+        if not ranked and ictx.instance_data.get("document_read_mode") != "per_document_read":
             ictx.instance_data["evidence"] = []
             ictx.instance_data["evidence_sufficient"] = False
             return None
 
-        evidence = await read_ranked_context(
-            clients=self._clients,
-            ranked=ranked,
-            top_k=int(os.getenv("RAG_EVIDENCE_TOP_K", "8")),
-        )
+        if ictx.instance_data.get("document_read_mode") == "per_document_read":
+            evidence, read_stats = await read_selected_documents_context(
+                clients=self._clients,
+                selected_documents=ictx.instance_data.get("selected_documents") or [],
+                ranked_anchors=ranked,
+            )
+            ictx.instance_data["document_read_stats"] = read_stats
+        else:
+            evidence = await read_ranked_context(
+                clients=self._clients,
+                ranked=ranked,
+                top_k=int(os.getenv("RAG_EVIDENCE_TOP_K", os.getenv("RAG_RANK_TOP_K", "10"))),
+            )
+            read_stats = {
+                "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
+            }
         ictx.instance_data["evidence"] = evidence
         ictx.instance_data["evidence_sufficient"] = bool(evidence)
         emit_progress(
@@ -655,6 +897,8 @@ class RagRetrievalWorkflow(Workflow):
                     for e in evidence
                     if e.get("read_mode")
                 }),
+                "document_read_mode": read_stats.get("document_read_mode"),
+                "document_read_stats": read_stats,
             },
         )
         ictx.instance_data["timings"]["read_ms"] = int((time.perf_counter() - t0) * 1000)
@@ -737,6 +981,9 @@ class RagRetrievalWorkflow(Workflow):
                         "hints": ictx.instance_data.get("hints", {}),
                     },
                     "route": ictx.instance_data.get("route"),
+                    "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
+                    "document_read_plan": ictx.instance_data.get("document_read_plan", []),
+                    "document_read_stats": ictx.instance_data.get("document_read_stats", {}),
                     "scope_count": ictx.instance_data.get("scope_count", 0),
                     "references": refs,
                     "evidence_count": len(ictx.instance_data.get("evidence", [])),
@@ -796,6 +1043,9 @@ class RagRetrievalWorkflow(Workflow):
                         "hints": ictx.instance_data.get("hints", {}),
                     },
                     "route": ictx.instance_data.get("route"),
+                    "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
+                    "document_read_plan": ictx.instance_data.get("document_read_plan", []),
+                    "document_read_stats": ictx.instance_data.get("document_read_stats", {}),
                     "scope_count": ictx.instance_data.get("scope_count", 0),
                     "references": refs,
                     "evidence_count": len(ranked),

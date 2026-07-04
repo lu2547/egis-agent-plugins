@@ -216,19 +216,27 @@ class RagTool(AgentTool):
             "score_source": scores.get("score_source", ""),
         }
 
+    @staticmethod
+    def _instance_data_from_state_delta(state_delta: dict[str, Any] | None) -> dict[str, Any]:
+        data = (
+            (state_delta or {})
+            .get("_workflows", {})
+            .get("rag", {})
+            .get("instances", {})
+        )
+        return next(iter(data.values())).get("data", {}) if data else {}
+
     @classmethod
     def _set_branch_recall_trace_attrs(cls, span: Any, state_delta: dict[str, Any] | None) -> None:
         try:
-            data = (
-                (state_delta or {})
-                .get("_workflows", {})
-                .get("rag", {})
-                .get("instances", {})
-            )
-            instance_data = next(iter(data.values())).get("data", {}) if data else {}
+            instance_data = cls._instance_data_from_state_delta(state_delta)
             selected = instance_data.get("selected_documents") or []
             rejected = instance_data.get("rejected_documents") or []
             excluded = instance_data.get("excluded_documents") or []
+            span.set_attribute(
+                "rag.document_read_mode",
+                instance_data.get("document_read_mode") or "global_chunk_rerank",
+            )
             span.set_attribute(
                 "rag.doc.strategy",
                 json.dumps(instance_data.get("document_match_strategy") or {}, ensure_ascii=False, default=str),
@@ -254,6 +262,25 @@ class RagTool(AgentTool):
             span.set_attribute("rag.doc.excluded_count", len(excluded))
         except Exception:
             logger.debug("[RagRetrieval] failed to set branch recall trace attrs", exc_info=True)
+
+    @classmethod
+    def _set_read_trace_attrs(cls, span: Any, state_delta: dict[str, Any] | None) -> None:
+        try:
+            instance_data = cls._instance_data_from_state_delta(state_delta)
+            span.set_attribute(
+                "rag.document_read_mode",
+                instance_data.get("document_read_mode") or "global_chunk_rerank",
+            )
+            span.set_attribute(
+                "rag.document_read_plan",
+                json.dumps(instance_data.get("document_read_plan") or [], ensure_ascii=False, default=str),
+            )
+            span.set_attribute(
+                "rag.document_read_stats",
+                json.dumps(instance_data.get("document_read_stats") or {}, ensure_ascii=False, default=str),
+            )
+        except Exception:
+            logger.debug("[RagRetrieval] failed to set read trace attrs", exc_info=True)
 
     async def execute(
         self,
@@ -317,6 +344,8 @@ class RagTool(AgentTool):
                 span.set_attribute("rag.new_state", result.new_state or "")
                 if action == "branch_recall":
                     self._set_branch_recall_trace_attrs(span, result.state_delta)
+                if action == "read":
+                    self._set_read_trace_attrs(span, result.state_delta)
                 try:
                     output_payload = {
                         "success": result.success,
@@ -470,6 +499,13 @@ class RagTool(AgentTool):
             ),
         )
         apply_dual_layer(result, digest, message)
+        logger.info(
+            "[RAG_TOOL] final_result content_chars=%d llm_digest_chars=%d refs=%d evidence=%d",
+            len(str(result.content or "")),
+            len(result.llm_digest or ""),
+            ref_count,
+            evidence_count,
+        )
         return result
 
     def _no_retrieval_result(
