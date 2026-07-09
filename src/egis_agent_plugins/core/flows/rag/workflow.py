@@ -417,6 +417,7 @@ class RagRetrievalWorkflow(Workflow):
             "query": doc_query,
             "summary_query": analysis_query,
             "top_k": int(os.getenv("RAG_DOCUMENT_SELECT_TOP_K", "20")),
+            "recall_top_k": int(os.getenv("RAG_DOCUMENT_SELECT_RECALL_TOP_K", "60")),
             "hints": ictx.instance_data.get("hints") or {},
         }
         if filters.get("rag_filter"):

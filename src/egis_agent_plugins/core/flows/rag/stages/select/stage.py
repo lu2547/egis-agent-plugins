@@ -23,6 +23,7 @@ from egis_agent_plugins.core.flows.rag.filters import (
     ResolvedFilters,
     resolve_filters,
 )
+from egis_agent_plugins.core.flows.rag.stages.rank.mmr import apply_mmr
 from egis_agent_plugins.core.service.base import MilvusSearchResult, RetrieverType
 
 logger = logging.getLogger(__name__)
@@ -196,16 +197,43 @@ def _dedup_documents(documents: list[dict]) -> list[dict]:
     return out
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _document_match_strategy(hints: dict[str, Any]) -> dict[str, Any]:
-    """Resolve filename/summary fusion weights strictly from model hints."""
-    preference = str(hints.get("document_match_preference") or "summary").strip()
+    """Resolve filename/summary fusion weights for document selection."""
+    preference = str(
+        hints.get("document_match_preference")
+        or os.getenv("RAG_DOCUMENT_MATCH_PREFERENCE")
+        or "filename"
+    ).strip()
     if preference == "filename":
-        filename_weight, summary_weight = 0.75, 0.25
+        filename_weight, summary_weight = 0.8, 0.2
     elif preference == "balanced":
         filename_weight, summary_weight = 0.5, 0.5
     else:
         preference = "summary"
-        filename_weight, summary_weight = 0.25, 0.75
+        filename_weight, summary_weight = 0.2, 0.8
+
+    filename_weight = _env_float("RAG_DOCUMENT_SELECT_FILENAME_WEIGHT", filename_weight)
+    summary_weight = _env_float("RAG_DOCUMENT_SELECT_SUMMARY_WEIGHT", summary_weight)
+    total = filename_weight + summary_weight
+    if total <= 0:
+        filename_weight, summary_weight = 0.8, 0.2
+    else:
+        filename_weight = filename_weight / total
+        summary_weight = summary_weight / total
     return {
         "document_match_preference": preference,
         "weights": {
@@ -240,6 +268,16 @@ def _summary_match_text(doc: dict[str, Any]) -> str:
     if content:
         return f"摘要：{content}"
     return f"文档：{title}" if title else ""
+
+
+def _document_diversity_text(doc: dict[str, Any]) -> str:
+    """Text surface for document-level MMR diversity."""
+    parts = [
+        str(doc.get("knowledge_title") or "").strip(),
+        str(doc.get("file_name") or "").strip(),
+        str(doc.get("content") or "").strip(),
+    ]
+    return "\n".join(part for part in parts if part)
 
 
 def _get_filename_score_llm() -> Any:
@@ -439,23 +477,41 @@ def _shortlist_documents(
             "best_score": 0.0,
         }
 
-    max_documents = max(1, int(os.getenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "3")))
-    min_score = float(os.getenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0.15"))
-    relative_to_best = float(os.getenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.85"))
+    max_documents = max(1, _env_int("RAG_DOCUMENT_SELECT_FINAL_TOP_K", 3))
+    min_score = _env_float("RAG_DOCUMENT_SELECT_MIN_SCORE", 0.15)
+    relative_to_best = _env_float("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", 0.85)
+    diversity_strategy = os.getenv("RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY", "mmr").strip().lower()
+    mmr_lambda = max(0.0, min(1.0, _env_float("RAG_DOCUMENT_SELECT_MMR_LAMBDA", 0.7)))
     best_score = max(float(doc.get("score", 0.0) or 0.0) for doc in documents)
     cutoff = max(min_score, best_score * relative_to_best)
 
-    selected = [
+    eligible = [
         doc for doc in documents
         if float(doc.get("score", 0.0) or 0.0) >= cutoff
-    ][:max_documents]
-    rejected = [doc for doc in documents if doc not in selected]
+    ]
+    if diversity_strategy == "mmr" and len(eligible) > max_documents:
+        selected = apply_mmr(
+            eligible,
+            relevance_fn=lambda doc: float(doc.get("score", 0.0) or 0.0),
+            content_fn=_document_diversity_text,
+            k=max_documents,
+            lambda_=mmr_lambda,
+        )
+    else:
+        diversity_strategy = "score"
+        selected = eligible[:max_documents]
+
+    selected_ids = {id(doc) for doc in selected}
+    rejected = [doc for doc in documents if id(doc) not in selected_ids]
     thresholds = {
         "max_documents": max_documents,
         "min_score": min_score,
         "relative_to_best": relative_to_best,
         "best_score": best_score,
         "cutoff": cutoff,
+        "eligible_documents": len(eligible),
+        "diversity_strategy": diversity_strategy,
+        "mmr_lambda": mmr_lambda if diversity_strategy == "mmr" else None,
         "recall_source": "summary_milvus_rrf",
         "score_source": "llm_filename_plus_summary_rerank",
     }
@@ -556,7 +612,18 @@ async def run(
 
     kb_ids_raw = scoped_kb_ids or clients.default_kb_ids
     kb_ids_in = _ensure_str_list(kb_ids_raw) or kb_ids_raw
-    top_k = args.get("top_k", 10)
+    legacy_top_k = args.get("top_k")
+    try:
+        legacy_top_k_int = int(legacy_top_k) if legacy_top_k is not None else _env_int("RAG_DOCUMENT_SELECT_TOP_K", 20)
+    except (TypeError, ValueError):
+        legacy_top_k_int = _env_int("RAG_DOCUMENT_SELECT_TOP_K", 20)
+    recall_top_k = args.get("recall_top_k")
+    try:
+        recall_top_k_int = int(recall_top_k) if recall_top_k is not None else _env_int("RAG_DOCUMENT_SELECT_RECALL_TOP_K", 60)
+    except (TypeError, ValueError):
+        recall_top_k_int = _env_int("RAG_DOCUMENT_SELECT_RECALL_TOP_K", 60)
+    final_top_k = _env_int("RAG_DOCUMENT_SELECT_FINAL_TOP_K", 3)
+    top_k = max(1, legacy_top_k_int, recall_top_k_int, final_top_k)
 
     # 名称 → ID 解析
     _t_resolve = time.perf_counter()

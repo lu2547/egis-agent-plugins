@@ -58,15 +58,24 @@ summary initial recall
 调整默认参数：
 
 ```text
+RAG_DOCUMENT_SELECT_RECALL_TOP_K=60
+RAG_DOCUMENT_SELECT_FILENAME_WEIGHT=0.8
+RAG_DOCUMENT_SELECT_SUMMARY_WEIGHT=0.2
 RAG_DOCUMENT_SELECT_FINAL_TOP_K=3
 RAG_DOCUMENT_SELECT_RELATIVE_SCORE=0.85
+RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY=mmr
+RAG_DOCUMENT_SELECT_MMR_LAMBDA=0.7
 ```
 
 含义：
 
+- 默认从 summary collection 初召回 60 个候选文档，再进入文件名/摘要融合打分。
+- 文档融合分数默认按 `filename * 0.8 + summary * 0.2`，因为 summary 内容可能不准，文件名/标题匹配优先。
 - 默认最多选择 3 个文档。
 - 只有 `doc.final_score >= best_score * 0.85` 的文档才进入后续读取。
 - `RAG_DOCUMENT_SELECT_MIN_SCORE` 可以保留，用作绝对下限。
+- 默认最终选择使用 MMR 多样性去重，避免多个相似摘要/副本文档挤占最终名额；需要纯分数排序时设为 `RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY=score`。
+- `RAG_DOCUMENT_SELECT_MMR_LAMBDA` 控制相关性与多样性的权衡，越接近 1 越偏向分数，越接近 0 越偏向差异化。
 
 这样能减少弱相关文档混入，尤其是“文件名/摘要擦边但不是用户指定资料”的情况。
 
@@ -406,5 +415,3 @@ content
   - 每个文档分数
   - 每个文档走小文件还是大文件
   - 大文件 anchor 数、扩展块数、去重数量
-
-

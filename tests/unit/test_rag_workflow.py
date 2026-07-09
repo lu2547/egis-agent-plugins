@@ -343,7 +343,79 @@ class TestTypes:
 
 
 # ────────────────────────────────────────────────────────────
-# 4. Progress
+# 4. Document selection
+# ────────────────────────────────────────────────────────────
+
+
+class TestDocumentSelection:
+    def test_document_match_strategy_defaults_to_filename_heavy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _document_match_strategy
+
+        monkeypatch.delenv("RAG_DOCUMENT_MATCH_PREFERENCE", raising=False)
+        monkeypatch.delenv("RAG_DOCUMENT_SELECT_FILENAME_WEIGHT", raising=False)
+        monkeypatch.delenv("RAG_DOCUMENT_SELECT_SUMMARY_WEIGHT", raising=False)
+
+        strategy = _document_match_strategy({})
+
+        assert strategy["document_match_preference"] == "filename"
+        assert strategy["weights"] == {"filename": 0.8, "summary": 0.2}
+
+    def test_document_match_strategy_allows_env_weight_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _document_match_strategy
+
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FILENAME_WEIGHT", "8")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_SUMMARY_WEIGHT", "2")
+
+        strategy = _document_match_strategy({"document_match_preference": "summary"})
+
+        assert strategy["document_match_preference"] == "summary"
+        assert strategy["weights"] == {"filename": 0.8, "summary": 0.2}
+
+    def test_shortlist_uses_mmr_for_diverse_documents(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _shortlist_documents
+
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "2")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.95")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY", "mmr")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MMR_LAMBDA", "0.5")
+
+        docs = [
+            {"knowledge_id": "a", "score": 1.0, "file_name": "养老险产品介绍.pdf", "content": "养老险 产品 介绍 账户 权益"},
+            {"knowledge_id": "b", "score": 0.99, "file_name": "养老险产品介绍副本.pdf", "content": "养老险 产品 介绍 账户 权益"},
+            {"knowledge_id": "c", "score": 0.98, "file_name": "投资报告.pdf", "content": "投资 组合 收益 风险 回撤"},
+        ]
+
+        selected, rejected, thresholds = _shortlist_documents(docs)
+
+        assert [doc["knowledge_id"] for doc in selected] == ["a", "c"]
+        assert [doc["knowledge_id"] for doc in rejected] == ["b"]
+        assert thresholds["diversity_strategy"] == "mmr"
+        assert thresholds["eligible_documents"] == 3
+
+    def test_shortlist_can_keep_score_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _shortlist_documents
+
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "2")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.95")
+        monkeypatch.setenv("RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY", "score")
+
+        docs = [
+            {"knowledge_id": "a", "score": 1.0, "file_name": "养老险产品介绍.pdf", "content": "养老险 产品 介绍 账户 权益"},
+            {"knowledge_id": "b", "score": 0.99, "file_name": "养老险产品介绍副本.pdf", "content": "养老险 产品 介绍 账户 权益"},
+            {"knowledge_id": "c", "score": 0.98, "file_name": "投资报告.pdf", "content": "投资 组合 收益 风险 回撤"},
+        ]
+
+        selected, rejected, thresholds = _shortlist_documents(docs)
+
+        assert [doc["knowledge_id"] for doc in selected] == ["a", "b"]
+        assert [doc["knowledge_id"] for doc in rejected] == ["c"]
+        assert thresholds["diversity_strategy"] == "score"
+
+
+# ────────────────────────────────────────────────────────────
+# 5. Progress
 # ────────────────────────────────────────────────────────────
 
 
