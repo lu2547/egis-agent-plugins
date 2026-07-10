@@ -210,6 +210,34 @@ class RagTool(AgentTool):
         return filters
 
     @staticmethod
+    def _inject_emit_event(ctx: dict[str, Any]) -> None:
+        """Bridge system:event_handler → ctx['emit_event'] callable.
+
+        ToolExecutor 将 StreamEventBus 注入到 ctx['system:event_handler']，
+        但 workflow effect 里的 emit_progress / emit_references 读取的是
+        ctx['emit_event']（一个接收 dict 的 callable）。本方法拉通两者。
+        """
+        if "emit_event" in ctx:
+            return  # 已有显式注入（单测场景），不覆盖
+        handler = ctx.get("system:event_handler")
+        if handler is None:
+            return
+        on_custom = getattr(handler, "on_custom_event", None)
+        if not callable(on_custom):
+            return
+
+        def _emit(event: dict[str, Any]) -> None:
+            event_type = event.get("type", "rag_progress")
+            if event_type == "custom":
+                # events.py 里 emit 的 frontend_digest 封装
+                on_custom(event.get("custom_type", ""), event.get("custom_data", {}))
+            else:
+                # rag_progress / references 等原始事件，统一走 custom event 通道
+                on_custom(event_type, event)
+
+        ctx["emit_event"] = _emit
+
+    @staticmethod
     def _slim_state_delta(state_delta: dict[str, Any]) -> dict[str, Any]:
         """Drop workflow-private RAG internals before writing back to session."""
         slim = dict(state_delta)
@@ -382,6 +410,10 @@ class RagTool(AgentTool):
         t_total = time.perf_counter()
         args = tool_call.arguments
         ctx = context or {}
+
+        # 桥接 emit_event: 把框架注入的 system:event_handler (StreamEventBus)
+        # 转为 workflow effect 里 emit_progress / emit_references 能调用的 callable。
+        self._inject_emit_event(ctx)
 
         query = args.get("query", "")
         source = args.get("source", "auto")

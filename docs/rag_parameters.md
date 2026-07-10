@@ -132,7 +132,7 @@
 | ------------------------------ | ------ | --------------------------------------- |
 | `RAG_CHUNK_RECALL_TOP_K`       | `40`   | 全局 chunk 级混合检索的 top_k           |
 | `RAG_CHUNK_RECALL_MAX_QUERIES` | `12`   | 单轮最大查询数（补搜轮从 gap 查询中取） |
-| `RAG_RETRIEVAL_CONCURRENCY`    | `6`    | 通用检索并发度（多个阶段共享此默认值）  |
+| `RAG_RETRIEVAL_CONCURRENCY`    | `2`    | 通用检索并发度（多个阶段共享此默认值）  |
 | `RAG_DEFAULT_TOP_K`            | `10`   | 默认搜索 top_k（基础配置层）            |
 | `RAG_VECTOR_THRESHOLD`         | `0.2`  | 向量检索分数阈值                        |
 | `RAG_KEYWORD_THRESHOLD`        | `0.3`  | 关键词检索分数阈值                      |
