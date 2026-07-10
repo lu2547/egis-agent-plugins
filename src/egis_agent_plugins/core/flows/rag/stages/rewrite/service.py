@@ -50,6 +50,7 @@ _MAX_HISTORY_CHARS = 100
 class RewriteResult:
     """Query Rewrite 输出"""
     rewrite_query: str
+    resolved_query: str = ""
     sub_queries: list[str] = field(default_factory=list)
     intent: IntentType = "rag"
     keywords: list[str] = field(default_factory=list)
@@ -57,16 +58,21 @@ class RewriteResult:
     analysis_query: str = ""
     # 文档选择专用的独立查询计划，不受通用 sub_queries 上限影响。
     doc_queries: list[str] = field(default_factory=list)
+    continues_previous_rag: bool = False
+    reuse_previous_documents: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "rewrite_query": self.rewrite_query,
+            "resolved_query": self.resolved_query or self.rewrite_query,
             "sub_queries": self.sub_queries,
             "intent": self.intent,
             "keywords": self.keywords,
             "doc_query": self.doc_query,
             "analysis_query": self.analysis_query,
             "doc_queries": self.doc_queries,
+            "continues_previous_rag": self.continues_previous_rag,
+            "reuse_previous_documents": self.reuse_previous_documents,
         }
 
 
@@ -143,6 +149,8 @@ class QueryRewriteService:
         history: list[dict[str, str]] | None = None,
         language: str = "zh-CN",
         pinned_knowledge_ids: list[str] | None = None,
+        current_user_input: str = "",
+        previous_rag_context: dict[str, Any] | None = None,
     ) -> RewriteResult:
         """执行 Query Rewrite
 
@@ -159,6 +167,7 @@ class QueryRewriteService:
         if pinned_knowledge_ids:
             return RewriteResult(
                 rewrite_query=query,
+                resolved_query=query,
                 sub_queries=[query],
                 intent="rag",
                 keywords=self._extract_simple_keywords(query),
@@ -168,12 +177,19 @@ class QueryRewriteService:
             )
 
         try:
-            result = await self._call_llm(query, history=history, language=language)
+            result = await self._call_llm(
+                query,
+                history=history,
+                language=language,
+                current_user_input=current_user_input,
+                previous_rag_context=previous_rag_context,
+            )
             return result
         except Exception as e:
             logger.warning("[QueryRewrite] LLM 调用失败, 使用原始 query: %s", e)
             return RewriteResult(
                 rewrite_query=query,
+                resolved_query=query,
                 sub_queries=[query],
                 intent=_DEFAULT_INTENT,
                 keywords=self._extract_simple_keywords(query),
@@ -185,6 +201,8 @@ class QueryRewriteService:
         *,
         history: list[dict[str, str]] | None = None,
         language: str = "zh-CN",
+        current_user_input: str = "",
+        previous_rag_context: dict[str, Any] | None = None,
     ) -> RewriteResult:
         """调用 LLM 进行改写。
 
@@ -206,6 +224,12 @@ class QueryRewriteService:
 ## 用户问题
 {query}
 
+## 当前用户原话
+{current_user_input or query}
+
+## 上一轮 RAG 上下文
+{json.dumps(previous_rag_context or {}, ensure_ascii=False)}
+
 ## 当前日期
 {date.today().isoformat()}
 
@@ -225,7 +249,7 @@ class QueryRewriteService:
                 self._llm.ainvoke(
                     messages,
                     temperature=self._temperature,
-                    max_tokens=500,
+                    max_tokens=700,
                 ),
                 timeout=self._LLM_TIMEOUT,
             )
@@ -250,12 +274,14 @@ class QueryRewriteService:
             logger.warning("[QueryRewrite] JSON 解析失败: %s", raw[:200])
             return RewriteResult(
                 rewrite_query=original_query,
+                resolved_query=original_query,
                 sub_queries=[original_query],
                 intent=_DEFAULT_INTENT,
                 keywords=self._extract_simple_keywords(original_query),
             )
 
         rewrite_query = data.get("rewrite_query", original_query) or original_query
+        resolved_query = data.get("resolved_query", original_query) or original_query
         doc_query = data.get("doc_query", "") or ""
         analysis_query = data.get("analysis_query", "") or ""
         sub_queries = data.get("sub_queries", [rewrite_query])
@@ -288,12 +314,15 @@ class QueryRewriteService:
 
         return RewriteResult(
             rewrite_query=rewrite_query,
+            resolved_query=resolved_query,
             sub_queries=sub_queries,
             intent=intent,
             keywords=keywords[:5],
             doc_query=doc_query,
             analysis_query=analysis_query,
             doc_queries=doc_queries,
+            continues_previous_rag=data.get("continues_previous_rag") is True,
+            reuse_previous_documents=data.get("reuse_previous_documents") is True,
         )
 
     @staticmethod

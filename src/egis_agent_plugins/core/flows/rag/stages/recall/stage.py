@@ -170,7 +170,7 @@ async def _resolve_collection_groups(
 
     groups = group_by_collection_from_names(collection_map)
     if groups:
-        logger.info(
+        logger.debug(
             "[KnowledgeSearch] routed by knowledge.collection_name: %s",
             {k: len(v) for k, v in groups.items()},
         )
@@ -285,7 +285,7 @@ async def _fill_knowledge_titles(clients: RAGClients, results: list[SearchResult
         results[:] = [r for r in results if r.knowledge_id in knowledge_map]
         dropped = before - len(results)
         if dropped > 0:
-            logger.info("[KnowledgeSearch] 过滤 %d 条孤儿结果（PG 无对应 knowledge 记录）", dropped)
+            logger.debug("[KnowledgeSearch] 过滤 %d 条孤儿结果（PG 无对应 knowledge 记录）", dropped)
     except Exception as e:
         logger.warning("[KnowledgeSearch] 填充 knowledge title 失败: %s", e)
 
@@ -371,8 +371,8 @@ async def run(
 
     if not queries:
         return {"error": "queries 参数不能为空"}
-    if len(queries) > 5:
-        queries = queries[:5]
+    max_queries = max(1, int(os.getenv("RAG_CHUNK_RECALL_MAX_QUERIES", "12")))
+    queries = queries[:max_queries]
 
     # 名称 → ID 解析
     _t_resolve = time.perf_counter()
@@ -386,9 +386,9 @@ async def run(
     except Exception as e:
         logger.error("[KnowledgeSearch] resolve_filters failed: %s", e)
         return {"error": f"过滤条件解析失败: {e}"}
-    logger.info("[KS] stage=resolve_filters cost_ms=%d", int((time.perf_counter() - _t_resolve) * 1000))
+    logger.debug("[KS] stage=resolve_filters cost_ms=%d", int((time.perf_counter() - _t_resolve) * 1000))
 
-    logger.info(
+    logger.debug(
         "[KnowledgeSearch] queries=%s, kb_ids=%s, tag_ids=%s, knowledge_ids=%s",
         queries, resolved.kb_ids, resolved.tag_ids, resolved.knowledge_ids,
     )
@@ -397,7 +397,7 @@ async def run(
         effective_queries = [q for q in queries if q and q.strip()]
         if not effective_queries:
             return {"error": "queries 全为空"}
-        recall_queries = effective_queries[:1] if scope_plan.has_scopes else effective_queries
+        recall_queries = effective_queries
 
         _t_embed = time.perf_counter()
         try:
@@ -405,7 +405,7 @@ async def run(
         except Exception as e:
             logger.error("[KnowledgeSearch] embed_queries failed: %s", e)
             return {"error": f"embedding 失败: {e}"}
-        logger.info("[KS] stage=embed cost_ms=%d", int((time.perf_counter() - _t_embed) * 1000))
+        logger.debug("[KS] stage=embed cost_ms=%d", int((time.perf_counter() - _t_embed) * 1000))
 
         scopes = scope_plan.scopes if scope_plan.has_scopes else [RecallScope()]
         if not scopes:
@@ -419,7 +419,11 @@ async def run(
 
         # 多 query 并发 Milvus 检索
         _t_milvus = time.perf_counter()
-        sem = asyncio.Semaphore(int(os.getenv("RAG_SCOPE_RECALL_CONCURRENCY", "3")))
+        default_concurrency = os.getenv("RAG_RETRIEVAL_CONCURRENCY", "6")
+        sem = asyncio.Semaphore(max(
+            1,
+            int(os.getenv("RAG_SCOPE_RECALL_CONCURRENCY", default_concurrency)),
+        ))
 
         async def _search_scope_query(scope: RecallScope, q: str, emb: list[float]) -> list[SearchResult]:
             scope_groups = _collection_groups_for_scope(clients, resolved, scope)
@@ -447,7 +451,7 @@ async def run(
                 )
             for item in results:
                 item.query_type = f"{item.query_type}:scoped"
-            logger.info(
+            logger.debug(
                 "[KnowledgeSearch] scope=%s query='%s' results=%d filter=%s",
                 scope.kb_id or "*",
                 q[:40],
@@ -462,7 +466,7 @@ async def run(
             for q, emb in zip(recall_queries, embeddings)
         ]
         per_query_results = await asyncio.gather(*search_tasks, return_exceptions=True)
-        logger.info("[KS] stage=milvus cost_ms=%d", int((time.perf_counter() - _t_milvus) * 1000))
+        logger.debug("[KS] stage=milvus cost_ms=%d", int((time.perf_counter() - _t_milvus) * 1000))
 
         all_results: list[SearchResult] = []
         for res in per_query_results:
@@ -484,7 +488,7 @@ async def run(
             }
 
         deduplicated = _deduplicate_results(all_results)
-        logger.info("[KnowledgeSearch] 去重后: %d 条", len(deduplicated))
+        logger.debug("[KnowledgeSearch] 去重后: %d 条", len(deduplicated))
 
         # Keep a deterministic baseline order for rank stage input.
         deduplicated.sort(key=lambda x: x.score, reverse=True)
@@ -492,7 +496,7 @@ async def run(
         # 填充 title
         _t_fill = time.perf_counter()
         await _fill_knowledge_titles(clients, deduplicated)
-        logger.info("[KS] stage=fill_titles cost_ms=%d", int((time.perf_counter() - _t_fill) * 1000))
+        logger.debug("[KS] stage=fill_titles cost_ms=%d", int((time.perf_counter() - _t_fill) * 1000))
 
         output = _format_output(deduplicated, queries, resolved.kb_ids)
         return {

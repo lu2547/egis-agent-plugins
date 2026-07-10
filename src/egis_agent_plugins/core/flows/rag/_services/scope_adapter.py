@@ -129,8 +129,13 @@ class ScopePlan:
 
 def read_rag_state(ctx: dict[str, Any] | None) -> dict[str, Any]:
     """Read frontend-injected RAG state from a tool context."""
-    raw = (ctx or {}).get("rag_state") or (ctx or {}).get(RAG_STATE_KEY) or {}
-    return raw if isinstance(raw, dict) else {}
+    mapping = ctx or {}
+    persisted = mapping.get(RAG_STATE_KEY)
+    request_state = mapping.get("rag_state")
+    merged = dict(persisted) if isinstance(persisted, dict) else {}
+    if isinstance(request_state, dict):
+        merged.update(request_state)
+    return merged
 
 
 def _extract_file_id(file_obj: Any) -> str:

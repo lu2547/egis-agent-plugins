@@ -148,7 +148,7 @@ class Rerank:
                 )
             )
 
-        logger.info(
+        logger.debug(
             f"[Rerank] provider={self._config.rerank_provider} "
             f"model={self._config.rerank_model} "
             f"input={len(doc_texts)} → output={len(results)}"

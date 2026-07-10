@@ -13,6 +13,7 @@ auto-drive 完成 rewrite → route → recall → rank → read → decide 全�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -42,8 +43,9 @@ from .guards import (
     is_obvious_no_retrieval_query,
 )
 from .events import emit_progress, emit_references
-from .schema import Candidate, Reference, new_instance_data
+from .schema import Candidate, Reference, DEFAULT_QUALITY_MAX_RETRIES, new_instance_data
 from .stages.rank.stage import run as _rank_run
+from .stages.evaluate.stage import run as _evaluate_run
 from .stages.recall.stage import run as _recall_run
 from .stages.recall.web import run as _web_run
 from .stages.rewrite.stage import run as _rewrite_run
@@ -59,28 +61,32 @@ from egis_agent_plugins.core.flows.rag._services.scope_adapter import read_rag_s
 logger = logging.getLogger(__name__)
 
 
+def _ranked_by_document(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in ranked:
+        knowledge_id = str(item.get("knowledge_id") or "")
+        key = knowledge_id or str(item.get("knowledge_title") or "unknown")
+        entry = grouped.setdefault(
+            key,
+            {
+                "title": item.get("knowledge_title") or item.get("file_name") or knowledge_id,
+                "kid": knowledge_id,
+                "chunk_count": 0,
+            },
+        )
+        entry["chunk_count"] += 1
+    return sorted(
+        grouped.values(),
+        key=lambda item: (-int(item["chunk_count"]), str(item["title"])),
+    )
+
+
 def _document_read_mode() -> str:
     mode = (os.getenv("RAG_DOCUMENT_READ_MODE") or "global_chunk_rerank").strip()
     if mode not in {"global_chunk_rerank", "per_document_read"}:
         logger.warning("[RAG WF] unknown RAG_DOCUMENT_READ_MODE=%s, using global_chunk_rerank", mode)
         return "global_chunk_rerank"
     return mode
-
-
-# ── Scope helpers ──────────────────────────────────────────────────────────
-
-
-def _has_doc_scope(filters: dict[str, Any]) -> bool:
-    """Whether the user explicitly constrained retrieval to documents/files."""
-    for kb in filters.get("rag_filter") or []:
-        if not isinstance(kb, dict):
-            continue
-        if kb.get("files"):
-            return True
-        for tag in kb.get("tags") or kb.get("tag") or []:
-            if isinstance(tag, dict) and tag.get("files"):
-                return True
-    return False
 
 
 def _routed_web(ictx: InstanceCtx) -> None:
@@ -144,7 +150,32 @@ class RagRetrievalWorkflow(Workflow):
         clients: Any = None,
     ) -> None:
         self._clients = clients
+        # Per-tool-call temporary evidence cache. It is intentionally kept out
+        # of workflow/session state, so repeated retrieval rounds do not
+        # serialize full chunk content into the conversation context.
+        self._evidence_pools: dict[str, list[dict[str, Any]]] = {}
         self.transitions = self._build_transitions()
+
+    def _update_evidence_pool(
+        self,
+        ictx: InstanceCtx,
+        current: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        round_number = int(ictx.instance_data.get("attempt", 0) or 0) + 1
+        tagged = []
+        for item in current:
+            copy = dict(item)
+            copy["_quality_round"] = round_number
+            tagged.append(copy)
+        merged = _merge_evidence_rounds(
+            self._evidence_pools.get(ictx.instance_id, []),
+            tagged,
+        )
+        pool_limit = max(1, int(os.getenv("RAG_EVIDENCE_POOL_MAX_CHUNKS", "100")))
+        if len(merged) > pool_limit:
+            merged = _select_evidence_by_document(merged, max_items=pool_limit)
+        self._evidence_pools[ictx.instance_id] = merged
+        return merged
 
     # ── Transition builder ───────────────────────────────────────────────
 
@@ -194,9 +225,9 @@ class RagRetrievalWorkflow(Workflow):
                        guard=_no_candidates,
                        effect=self._ef_mark_no_candidates),
 
-            # ── read ──
+            # ── read ( + 内嵌 evaluate ) ──
             Transition("read", "ranked", "evidence_checked",
-                       effect=self._ef_parallel_read_and_assess),
+                       effect=self._ef_read_and_evaluate),
 
             # ── decide: 两条 guarded fork ──
             Transition("decide", "evidence_checked", "answer_ready",
@@ -226,7 +257,9 @@ class RagRetrievalWorkflow(Workflow):
         ictx.instance_data["query"] = query
         ictx.instance_data["source"] = ictx.args.get("source", "auto")
         ictx.instance_data["filters"] = ictx.args.get("filters") or {}
-        ictx.instance_data["max_retries"] = int(ictx.args.get("max_retries", 1))
+        ictx.instance_data["max_retries"] = int(
+            ictx.args.get("max_retries", DEFAULT_QUALITY_MAX_RETRIES)
+        )
         ictx.instance_data["attempt"] = 0
         ictx.instance_data["timings"] = {}
         return EffectOutput(message="问题无需检索，可直接回答。")
@@ -238,7 +271,7 @@ class RagRetrievalWorkflow(Workflow):
             source=ictx.args.get("source", "auto"),
             filters=ictx.args.get("filters"),
             hints=ictx.args.get("hints") or {},
-            max_retries=int(ictx.args.get("max_retries", 1)),
+            max_retries=int(ictx.args.get("max_retries", DEFAULT_QUALITY_MAX_RETRIES)),
         )
         ictx.instance_data.update(data)
 
@@ -263,7 +296,7 @@ class RagRetrievalWorkflow(Workflow):
                 source=ictx.args.get("source", "auto"),
                 filters=ictx.args.get("filters"),
                 hints=ictx.args.get("hints") or {},
-                max_retries=int(ictx.args.get("max_retries", 1)),
+                max_retries=int(ictx.args.get("max_retries", DEFAULT_QUALITY_MAX_RETRIES)),
             )
             ictx.instance_data.update(data)
 
@@ -288,11 +321,24 @@ class RagRetrievalWorkflow(Workflow):
             ictx.instance_data["timings"]["rewrite_ms"] = int((time.perf_counter() - t0) * 1000)
             return None
 
-        emit_progress(ctx, tool="query_rewrite", status="pending")
+        emit_progress(
+            ctx,
+            tool="query_rewrite",
+            status="pending",
+            extra={"input": query},
+        )
 
+        current_user_input = str(ictx.args.get("current_user_input") or query).strip()
+        previous_rag_context = (
+            ictx.args.get("previous_rag_context")
+            if isinstance(ictx.args.get("previous_rag_context"), dict)
+            else {}
+        )
         result = await _rewrite_run(
             args={
                 "query": query,
+                "current_user_input": current_user_input,
+                "previous_rag_context": previous_rag_context,
             },
             ctx=ctx,
             clients=self._clients,
@@ -306,6 +352,17 @@ class RagRetrievalWorkflow(Workflow):
         doc_query = result.get("doc_query", "")
         analysis_query = result.get("analysis_query", "")
         doc_queries = result.get("doc_queries", [])
+        resolved_query = str(result.get("resolved_query") or query).strip()
+        continues_previous_rag = bool(
+            previous_rag_context and result.get("continues_previous_rag")
+        )
+        reuse_previous_documents = bool(
+            continues_previous_rag and result.get("reuse_previous_documents")
+        )
+        if intent == "rag" and resolved_query:
+            # 后续质量评估和答案生成统一使用自包含问题；续问场景下它是
+            # “上一轮任务 + 本轮新增要求”，新问题场景下则是本轮规范化任务。
+            ictx.instance_data["query"] = resolved_query
 
         # 如果 LLM 没传 source 但 intent=web_search，设置 source=web
         if ictx.instance_data.get("source") == "auto" and intent == "web_search":
@@ -319,22 +376,75 @@ class RagRetrievalWorkflow(Workflow):
             "doc_query": doc_query,
             "analysis_query": analysis_query,
             "doc_queries": doc_queries,
+            "resolved_query": resolved_query,
+            "continues_previous_rag": continues_previous_rag,
+            "reuse_previous_documents": reuse_previous_documents,
         }
+        if intent == "rag":
+            # 补搜前提应是来源/材料限制，而不是需要得出的分析结论。
+            previous_context = (
+                previous_rag_context.get("context")
+                if isinstance(previous_rag_context.get("context"), dict)
+                else {}
+            )
+            previous_retrieval = (
+                previous_context.get("retrieval_context")
+                if isinstance(previous_context.get("retrieval_context"), dict)
+                else {}
+            )
+            premise = (
+                previous_context.get("premise")
+                or previous_retrieval.get("premise")
+                or doc_query
+                or rewrite_query
+                or resolved_query
+            ) if continues_previous_rag else (doc_query or rewrite_query or resolved_query)
+            retrieval_context = {
+                "premise": premise,
+                "original_query": resolved_query,
+                "doc_query": doc_query,
+                "doc_queries": list(doc_queries),
+                "analysis_query": analysis_query,
+                "keywords": list(keywords),
+                "conversation_summary": resolved_query,
+            }
+            if reuse_previous_documents:
+                previous_documents = previous_rag_context.get("selected_documents") or []
+                locked_documents = _compact_document_scope([
+                    item for item in previous_documents if isinstance(item, dict)
+                ])
+                if locked_documents:
+                    retrieval_context["selected_documents"] = locked_documents
+                    retrieval_context["selected_knowledge_ids"] = [
+                        item["knowledge_id"] for item in locked_documents
+                    ]
+                    ictx.instance_data["selected_documents"] = locked_documents
+                    ictx.instance_data["selected_knowledge_ids"] = [
+                        item["knowledge_id"] for item in locked_documents
+                    ]
+                    ictx.instance_data["reuse_selected_documents"] = True
+            ictx.instance_data["retrieval_context"] = retrieval_context
 
+        rewrite_log = {
+            "intent": intent,
+            "current_user_input": current_user_input,
+            "resolved_query": resolved_query,
+            "continues_previous_rag": continues_previous_rag,
+            "reuse_previous_documents": reuse_previous_documents,
+            "rewrite_query": rewrite_query,
+            "doc_query": doc_query,
+            "doc_queries": doc_queries,
+            "analysis_query": analysis_query,
+        }
         emit_progress(
             ctx,
             tool="query_rewrite",
             status="done",
-            extra={
-                "rewrite": rewrite_query,
-                "doc_query": doc_query,
-                "analysis_query": analysis_query,
-                "doc_queries": doc_queries,
-                "intent": intent,
-                "route": intent,
-                "keywords": keywords,
-                "sub_queries": sub_queries,
-            },
+            extra={"input": query, "result": rewrite_log},
+        )
+        logger.info(
+            "[RAG][rewrite] %s",
+            json.dumps({"input": query, "result": rewrite_log}, ensure_ascii=False),
         )
 
         ictx.instance_data["timings"]["rewrite_ms"] = int((time.perf_counter() - t0) * 1000)
@@ -417,6 +527,61 @@ class RagRetrievalWorkflow(Workflow):
             or ictx.instance_data.get("query", "")
         )
 
+        if ictx.instance_data.pop("reuse_selected_documents", False):
+            selected_documents = ictx.instance_data.get("selected_documents") or []
+            kid_list = [
+                str(document.get("knowledge_id") or "")
+                for document in selected_documents
+                if str(document.get("knowledge_id") or "")
+            ]
+            ictx.instance_data["selected_knowledge_ids"] = kid_list
+            ictx.instance_data["document_read_mode"] = (
+                "per_document_read" if len(selected_documents) > 1 else _document_read_mode()
+            )
+            ictx.instance_data["candidates"] = []
+            reused_log = [
+                {
+                    "rank": rank,
+                    "title": document.get("knowledge_title") or document.get("file_name", ""),
+                    "kid": document.get("knowledge_id", ""),
+                    "score": round(float(document.get("score", 0.0) or 0.0), 4),
+                }
+                for rank, document in enumerate(selected_documents, 1)
+            ]
+            logger.info(
+                "[RAG][select] %s",
+                json.dumps(
+                    {
+                        "queries": rewrite.get("doc_queries") or [],
+                        "selected": reused_log,
+                        "selected_count": len(reused_log),
+                        "reused_from_rag_state": True,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            emit_progress(
+                ctx,
+                tool="document_select",
+                status="done",
+                count=len(kid_list),
+                extra={
+                    "reused_locked_document_scope": True,
+                    "retry_queries": rewrite.get("sub_queries") or [],
+                    "documents": [
+                        {
+                            "knowledge_id": document.get("knowledge_id", ""),
+                            "title": document.get("knowledge_title") or document.get("file_name", ""),
+                        }
+                        for document in selected_documents
+                    ],
+                },
+            )
+            ictx.instance_data["timings"]["branch_recall_ms"] = int(
+                (time.perf_counter() - t0) * 1000
+            )
+            return None
+
         sd_args: dict[str, Any] = {
             "query": doc_query,
             "doc_queries": rewrite.get("doc_queries") or [],
@@ -435,17 +600,25 @@ class RagRetrievalWorkflow(Workflow):
             extra={
                 "query": doc_query,
                 "doc_queries": rewrite.get("doc_queries") or [],
-                "summary_query": analysis_query,
-                "document_match_strategy": {
-                    "hints": ictx.instance_data.get("hints") or {},
-                },
             },
         )
 
         try:
             result = await _select_run(clients=self._clients, args=sd_args, ctx=ctx)
         except Exception as e:
-            logger.warning("[RAG WF] rag select_documents failed: %s", e)
+            result = {"error": f"{type(e).__name__}: {e}"}
+            logger.warning(
+                "[RAG WF] rag select_documents raised: %s: %s",
+                type(e).__name__,
+                e,
+            )
+
+        # `_select_run` 内层 catch 后会返回 {"error": ...} 而不抛，早期这里会把失败
+        # 当成“选中零文档”默默吃掉，让 chunk_recall 走 _no_selected_docs → retry。
+        # 统一在这里识别 error 分支，清洗 selected_* 并 emit error 事件，与上方 except 分支合并。
+        if isinstance(result, dict) and result.get("error"):
+            err_msg = str(result.get("error") or "")
+            logger.warning("[RAG WF] rag select_documents failed: %s", err_msg)
             ictx.instance_data["selected_knowledge_ids"] = []
             ictx.instance_data["candidates"] = []
             ictx.instance_data["timings"]["branch_recall_ms"] = int((time.perf_counter() - t0) * 1000)
@@ -453,7 +626,7 @@ class RagRetrievalWorkflow(Workflow):
                 ctx,
                 tool="document_select",
                 status="error",
-                extra={"query": doc_query, "error": str(e)},
+                extra={"query": doc_query, "error": err_msg},
             )
             return None
 
@@ -464,6 +637,24 @@ class RagRetrievalWorkflow(Workflow):
         ictx.instance_data["document_select_thresholds"] = result.get("document_select_thresholds") or {}
         ictx.instance_data["rejected_documents"] = result.get("rejected_documents") or []
         ictx.instance_data["excluded_documents"] = result.get("excluded_documents") or []
+        retrieval_context = ictx.instance_data.get("retrieval_context") or {}
+        current_scope = _compact_document_scope(result.get("documents", []))
+        quality = ictx.instance_data.get("quality_evaluation") or {}
+        if int(ictx.instance_data.get("attempt", 0) or 0) == 0:
+            locked_scope = current_scope
+        elif quality.get("requires_document_reselection"):
+            locked_scope = _compact_document_scope([
+                *retrieval_context.get("selected_documents", []),
+                *current_scope,
+            ])
+        else:
+            locked_scope = retrieval_context.get("selected_documents", [])
+        if locked_scope:
+            retrieval_context["selected_documents"] = locked_scope
+            retrieval_context["selected_knowledge_ids"] = [
+                document["knowledge_id"] for document in locked_scope
+            ]
+            ictx.instance_data["retrieval_context"] = retrieval_context
         read_mode = _document_read_mode()
         selected_documents = result.get("documents", [])
         matched_queries = {
@@ -484,41 +675,29 @@ class RagRetrievalWorkflow(Workflow):
             status="done",
             count=len(kid_list),
             extra={
-                "query": doc_query,
-                "documents": [
+                "queries": rewrite.get("doc_queries") or [doc_query],
+                "selected": [
                     {
+                        "rank": rank,
                         "knowledge_id": doc.get("knowledge_id", ""),
                         "title": doc.get("knowledge_title") or doc.get("file_name", ""),
                         "score": doc.get("score", 0.0),
-                        "initial_recall_components": doc.get("initial_recall_components", {}),
-                        "document_match_scores": doc.get("document_match_scores", {}),
+                        "filename_score": (doc.get("document_match_scores") or {}).get("filename", 0.0),
+                        "summary_score": (doc.get("document_match_scores") or {}).get("summary", 0.0),
+                        "query_matches": [
+                            {
+                                "query": match.get("query", ""),
+                                "rank": match.get("rank", 0),
+                                "score": match.get("score", 0.0),
+                            }
+                            for match in doc.get("query_matches", [])
+                            if isinstance(match, dict)
+                        ],
                     }
-                    for doc in result.get("documents", [])[:8]
+                    for rank, doc in enumerate(result.get("documents", []), 1)
                 ],
-                "rejected_documents": [
-                    {
-                        "knowledge_id": doc.get("knowledge_id", ""),
-                        "title": doc.get("knowledge_title") or doc.get("file_name", ""),
-                        "score": doc.get("score", 0.0),
-                        "initial_recall_components": doc.get("initial_recall_components", {}),
-                        "document_match_scores": doc.get("document_match_scores", {}),
-                    }
-                    for doc in result.get("rejected_documents", [])[:8]
-                ],
-                "excluded_documents": [
-                    {
-                        "knowledge_id": doc.get("knowledge_id", ""),
-                        "title": doc.get("knowledge_title") or doc.get("file_name", ""),
-                        "score": doc.get("score", 0.0),
-                    }
-                    for doc in result.get("excluded_documents", [])[:8]
-                ],
-                "document_match_strategy": result.get("document_match_strategy") or {},
-                "document_select_thresholds": result.get("document_select_thresholds") or {},
-                "document_read_mode": ictx.instance_data["document_read_mode"],
             },
         )
-        logger.info("[RAG WF] rag → selected docs=%d; recall chunks next", len(kid_list))
         ictx.instance_data["timings"]["branch_recall_ms"] = int((time.perf_counter() - t0) * 1000)
         return None
 
@@ -532,13 +711,22 @@ class RagRetrievalWorkflow(Workflow):
 
     def _rag_queries(self, ictx: InstanceCtx) -> list[str]:
         rewrite = ictx.instance_data.get("rewrite") or {}
+        sub_queries = [
+            query.strip()
+            for query in rewrite.get("sub_queries", [])
+            if isinstance(query, str) and query.strip()
+        ]
+        max_queries = max(1, int(os.getenv("RAG_CHUNK_RECALL_MAX_QUERIES", "12")))
+        if int(ictx.instance_data.get("attempt", 0) or 0) > 0 and sub_queries:
+            # 补搜轮只执行评估器给出的原子缺口查询。不能再把原问题或拼接后的
+            # analysis_query 塞到前面，否则会占用查询名额并重新混合独立条件。
+            return list(dict.fromkeys(sub_queries))[:max_queries]
+
         query = (
             rewrite.get("analysis_query")
             or rewrite.get("rewrite_query")
             or ictx.instance_data.get("query", "")
         )
-        sub_queries = rewrite.get("sub_queries", [])
-
         original_query = ictx.instance_data.get("query", "")
         queries = [query] if query else []
         if original_query and original_query not in queries:
@@ -546,7 +734,7 @@ class RagRetrievalWorkflow(Workflow):
         for sq in sub_queries:
             if sq and sq not in queries:
                 queries.append(sq)
-        return queries[:5]
+        return queries[:max_queries]
 
     async def _ef_per_document_recall_rank(self, ictx: InstanceCtx) -> EffectOutput | None:
         """Per-document read mode: small docs read later, large docs recall/rank per file."""
@@ -630,7 +818,11 @@ class RagRetrievalWorkflow(Workflow):
             },
         )
 
-        sem = asyncio.Semaphore(int(os.getenv("RAG_PER_DOC_RECALL_CONCURRENCY", "3")))
+        default_concurrency = os.getenv("RAG_RETRIEVAL_CONCURRENCY", "6")
+        sem = asyncio.Semaphore(max(
+            1,
+            int(os.getenv("RAG_PER_DOC_RECALL_CONCURRENCY", default_concurrency)),
+        ))
         per_doc_recall_top_k = int(os.getenv("RAG_PER_DOC_CHUNK_RECALL_TOP_K", "40"))
         per_doc_rank_top_k = int(os.getenv("RAG_PER_DOC_CHUNK_RERANK_TOP_K", "10"))
         filters = ictx.instance_data.get("filters") or {}
@@ -673,16 +865,11 @@ class RagRetrievalWorkflow(Workflow):
                 ]
                 if not candidates:
                     return []
-                rank_query = (
-                    (ictx.instance_data.get("rewrite") or {}).get("analysis_query")
-                    or (ictx.instance_data.get("rewrite") or {}).get("rewrite_query")
-                    or ictx.instance_data.get("query", "")
-                )
                 rank_result = await _rank_run(
                     clients=self._clients,
                     args={
                         "candidates": candidates,
-                        "queries": [rank_query] if rank_query else queries,
+                        "queries": queries,
                         "top_k": per_doc_rank_top_k,
                     },
                     ctx=ctx,
@@ -692,7 +879,7 @@ class RagRetrievalWorkflow(Workflow):
                     item["document_score"] = float(doc.get("score", 0.0) or 0.0)
                     item["document_match_scores"] = doc.get("document_match_scores", {})
                     item["document_read_mode"] = "per_document_read"
-                logger.info(
+                logger.debug(
                     "[RAG WF] per-doc recall/rank kid=%s candidates=%d ranked=%d",
                     kid,
                     len(candidates),
@@ -743,22 +930,7 @@ class RagRetrievalWorkflow(Workflow):
             or rewrite.get("rewrite_query")
             or ictx.instance_data.get("query", "")
         )
-        sub_queries = rewrite.get("sub_queries", [])
-        keywords = rewrite.get("keywords", [])
-
-        # Build queries list: rewrite_query + sub_queries (deduplicated, max 5)
-        original_query = ictx.instance_data.get("query", "")
-        queries = [query] if query else []
-        if original_query and original_query not in queries:
-            queries.append(original_query)
-        for sq in sub_queries:
-            if sq and sq not in queries:
-                queries.append(sq)
-        try:
-            max_queries = max(1, int(os.getenv("RAG_CHUNK_RECALL_MAX_QUERIES", "12")))
-        except ValueError:
-            max_queries = 12
-        queries = queries[:max_queries]
+        queries = self._rag_queries(ictx)
 
         if not queries:
             ictx.instance_data["candidates"] = []
@@ -798,7 +970,7 @@ class RagRetrievalWorkflow(Workflow):
         # 诊断：recall 返回结果来源
         raw_kids = list(set(sr.get("knowledge_id", "") for sr in raw_results if sr.get("knowledge_id")))
         raw_titles = list(set(sr.get("knowledge_title", "") for sr in raw_results if sr.get("knowledge_title")))
-        logger.info(
+        logger.debug(
             "[RAG WF] recall DIAG: ks_args knowledge_ids=%s, raw_results=%d, unique_kids=%d %s, titles=%s",
             ks_args.get("knowledge_ids"), len(raw_results),
             len(raw_kids), raw_kids[:5], raw_titles[:5],
@@ -826,7 +998,7 @@ class RagRetrievalWorkflow(Workflow):
         return None
 
     async def _ef_mark_no_docs(self, ictx: InstanceCtx) -> EffectOutput | None:
-        logger.info("[RAG WF] No docs selected, marking insufficient")
+        logger.debug("[RAG WF] No docs selected, marking insufficient")
         return None
 
     async def _ef_fusion_rerank_mmr(self, ictx: InstanceCtx) -> EffectOutput | None:
@@ -835,31 +1007,23 @@ class RagRetrievalWorkflow(Workflow):
         if ictx.instance_data.get("document_read_mode") == "per_document_read":
             ranked = ictx.instance_data.get("per_document_ranked_anchors") or []
             ictx.instance_data["ranked"] = ranked
+            by_document = _ranked_by_document(ranked)
             emit_progress(
                 ictx.session_ctx,
                 tool="rank",
                 status="done",
                 count=len(ranked),
-                extra={
-                    "document_read_mode": "per_document_read",
-                    "rank_scope": "per_document",
-                    "document_read_plan": ictx.instance_data.get("document_read_plan", []),
-                },
+                extra={"by_document": by_document},
+            )
+            logger.info(
+                "[RAG][rerank] %s",
+                json.dumps({"by_document": by_document}, ensure_ascii=False),
             )
             ictx.instance_data["timings"]["rank_ms"] = int((time.perf_counter() - t0) * 1000)
             return None
 
         candidates = ictx.instance_data.get("candidates") or []
-        rewrite = ictx.instance_data.get("rewrite") or {}
-        query = (
-            rewrite.get("analysis_query")
-            or rewrite.get("rewrite_query")
-            or ictx.instance_data.get("query", "")
-        )
-        queries = [query] if query else []
-        for sq in rewrite.get("sub_queries", []):
-            if sq and sq not in queries:
-                queries.append(sq)
+        queries = self._rag_queries(ictx)
 
         result = await _rank_run(
             clients=self._clients,
@@ -868,12 +1032,17 @@ class RagRetrievalWorkflow(Workflow):
         )
 
         ictx.instance_data["ranked"] = result.get("ranked", [])
+        by_document = _ranked_by_document(ictx.instance_data["ranked"])
         emit_progress(
             ictx.session_ctx,
             tool="rank",
             status="done",
             count=len(ictx.instance_data["ranked"]),
-            extra={"queries": queries[:3]},
+            extra={"by_document": by_document},
+        )
+        logger.info(
+            "[RAG][rerank] %s",
+            json.dumps({"by_document": by_document}, ensure_ascii=False),
         )
         ictx.instance_data["timings"]["rank_ms"] = (
             result.get("rank_ms")
@@ -883,21 +1052,24 @@ class RagRetrievalWorkflow(Workflow):
         return None
 
     async def _ef_mark_no_candidates(self, ictx: InstanceCtx) -> EffectOutput | None:
-        logger.info("[RAG WF] No candidates after recall")
+        logger.debug("[RAG WF] No candidates after recall")
         return None
 
-    async def _ef_parallel_read_and_assess(self, ictx: InstanceCtx) -> EffectOutput | None:
-        """Read ranked chunk anchors into evidence via the document reader."""
+    async def _ef_read_and_evaluate(self, ictx: InstanceCtx) -> EffectOutput | None:
+        """Read ranked chunk anchors into evidence, then run the quality evaluator.
+
+        名字里不再提 parallel —— 实际是 `read → 等 evidence → evaluate` 串行。
+        """
         t0 = time.perf_counter()
         ctx = ictx.session_ctx
         ranked = ictx.instance_data.get("ranked") or []
 
         if not ranked and ictx.instance_data.get("document_read_mode") != "per_document_read":
-            ictx.instance_data["evidence"] = []
-            ictx.instance_data["evidence_sufficient"] = False
-            return None
-
-        if ictx.instance_data.get("document_read_mode") == "per_document_read":
+            evidence = []
+            read_stats = {
+                "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
+            }
+        elif ictx.instance_data.get("document_read_mode") == "per_document_read":
             evidence, read_stats = await read_selected_documents_context(
                 clients=self._clients,
                 selected_documents=ictx.instance_data.get("selected_documents") or [],
@@ -913,29 +1085,126 @@ class RagRetrievalWorkflow(Workflow):
             read_stats = {
                 "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
             }
-        evidence_before_budget = len(evidence)
-        evidence = _select_evidence_by_document(
-            evidence,
-            max_items=max(1, int(os.getenv("RAG_EVIDENCE_MAX_CHUNKS", "12"))),
+        evidence_pool = self._update_evidence_pool(ictx, evidence)
+        quality_evidence = _select_evidence_by_document(
+            evidence_pool,
+            max_items=max(1, int(os.getenv("RAG_QUALITY_MAX_EVIDENCE_CHUNKS", "15"))),
         )
-        read_stats["evidence_before_budget"] = evidence_before_budget
-        read_stats["evidence_after_budget"] = len(evidence)
-        ictx.instance_data["evidence"] = evidence
-        ictx.instance_data["evidence_sufficient"] = bool(evidence)
+        answer_evidence = _select_evidence_by_document(
+            evidence_pool,
+            max_items=max(1, int(os.getenv("RAG_EVIDENCE_MAX_CHUNKS", "30"))),
+        )
+        read_stats["evidence_pool_size"] = len(evidence_pool)
+        read_stats["quality_evidence_count"] = len(quality_evidence)
+        read_stats["answer_evidence_count"] = len(answer_evidence)
+        ictx.instance_data["evidence"] = answer_evidence
+
+        round_number = int(ictx.instance_data.get("attempt", 0) or 0) + 1
+        max_rounds = int(
+            ictx.instance_data.get("max_retries", DEFAULT_QUALITY_MAX_RETRIES)
+            or DEFAULT_QUALITY_MAX_RETRIES
+        ) + 1
+        emit_progress(
+            ctx,
+            tool="quality_evaluate",
+            status="pending",
+            extra={"round": round_number, "max_rounds": max_rounds},
+        )
+        previous_ledger = ictx.instance_data.get("gap_ledger") or {}
+        round_queries = self._rag_queries(ictx)
+        attempted_queries = list(dict.fromkeys([
+            *previous_ledger.get("attempted_queries", []),
+            *round_queries,
+        ]))
+        evaluation_ledger = {
+            **previous_ledger,
+            "attempted_queries": attempted_queries,
+        }
+        quality = await _evaluate_run(
+            args={
+                "query": ictx.instance_data.get("query", ""),
+                "query_plan": ictx.instance_data.get("rewrite") or {},
+                "retrieval_context": ictx.instance_data.get("retrieval_context") or {},
+                "gap_ledger": evaluation_ledger,
+                "selected_documents": ictx.instance_data.get("selected_documents") or [],
+                "evidence": quality_evidence,
+                "round_number": round_number,
+                "max_rounds": max_rounds,
+            },
+            ctx=ctx,
+        )
+        quality["round"] = round_number
+        quality["executed_queries"] = round_queries
+        retrieval_context = ictx.instance_data.get("retrieval_context") or {}
+        quality["retry_queries"] = _contextualize_retry_queries(
+            str(retrieval_context.get("premise") or ""),
+            quality.get("retry_queries") or [],
+        )
+        quality["retry_queries"] = [
+            query
+            for query in quality["retry_queries"]
+            if query not in attempted_queries
+        ]
+        retry_stalled = not bool(quality.get("passed")) and not quality["retry_queries"]
+        quality["retry_stalled"] = retry_stalled
+        resolved_points = list(dict.fromkeys([
+            *previous_ledger.get("resolved", []),
+            *quality.get("resolved_points", []),
+        ]))
+        gap_ledger = {
+            "resolved": resolved_points,
+            "unresolved": list(quality.get("missing_points") or []),
+            "next_queries": list(quality.get("retry_queries") or []),
+            "requires_document_reselection": bool(
+                quality.get("requires_document_reselection")
+            ),
+            "attempted_queries": attempted_queries,
+            "retry_stalled": retry_stalled,
+            "round": round_number,
+        }
+        ictx.instance_data["gap_ledger"] = gap_ledger
+        ictx.instance_data["quality_evaluation"] = quality
+        quality_history = list(ictx.instance_data.get("quality_history") or [])
+        quality_history.append(quality)
+        ictx.instance_data["quality_history"] = quality_history
+        ictx.instance_data["evidence_sufficient"] = bool(quality.get("passed"))
+        ictx.instance_data["retry_stalled"] = retry_stalled
+        quality_log = {
+            "round": round_number,
+            "score": quality.get("score", 0.0),
+            "passed": bool(quality.get("passed")),
+            "task_type": quality.get("task_type", ""),
+            "dimensions": quality.get("dimensions") or {},
+            "result": quality.get("reason", ""),
+            "evidence_count": len(quality_evidence),
+            "resolved_count": len(quality.get("resolved_points") or []),
+            "missing_count": len(quality.get("missing_points") or []),
+            "executed_queries": round_queries,
+            "missing_points": quality.get("missing_points") or [],
+            "next_queries": quality.get("retry_queries") or [],
+            "requires_document_reselection": bool(
+                quality.get("requires_document_reselection")
+            ),
+            "retry_stalled": retry_stalled,
+        }
+        emit_progress(
+            ctx,
+            tool="quality_evaluate",
+            status="done",
+            extra=quality_log,
+        )
+        logger.info(
+            "[RAG][quality] %s",
+            json.dumps(quality_log, ensure_ascii=False, default=str),
+        )
         emit_progress(
             ctx,
             tool="read",
             status="done",
-            count=len(evidence),
+            count=len(answer_evidence),
             extra={
-                "route": ictx.instance_data.get("route", ""),
-                "read_modes": sorted({
-                    str(e.get("read_mode", ""))
-                    for e in evidence
-                    if e.get("read_mode")
-                }),
-                "document_read_mode": read_stats.get("document_read_mode"),
-                "document_read_stats": read_stats,
+                "evidence_count": len(answer_evidence),
+                "quality": quality_log,
             },
         )
         ictx.instance_data["timings"]["read_ms"] = int((time.perf_counter() - t0) * 1000)
@@ -952,7 +1221,7 @@ class RagRetrievalWorkflow(Workflow):
         ranked_kids = list(set(item.get("knowledge_id", "") for item in ranked if item.get("knowledge_id")))
         ranked_titles = list(set(item.get("knowledge_title", "") for item in ranked if item.get("knowledge_title")))
         evidence_kids = list(set(item.get("knowledge_id", "") for item in evidence if item.get("knowledge_id")))
-        logger.info(
+        logger.debug(
             "[RAG WF] references DIAG: selected_kids=%d %s, ranked=%d, unique_kids=%d %s, evidence=%d unique_kids=%d %s, titles=%s",
             len(selected_kids), selected_kids[:3],
             len(ranked), len(ranked_kids), ranked_kids[:5],
@@ -989,7 +1258,7 @@ class RagRetrievalWorkflow(Workflow):
             selected_documents=ictx.instance_data.get("selected_documents") or [],
         )
 
-        logger.info(
+        logger.debug(
             "[RAG_EFFECT] emit_references: %d refs, chunk_ids=%s",
             len(refs),
             [r.get("chunk_id", "?")[:8] for r in refs[:5]],
@@ -1003,9 +1272,11 @@ class RagRetrievalWorkflow(Workflow):
             }
             for ev in evidence_items
         ]
+        self._evidence_pools.pop(ictx.instance_id, None)
         return EffectOutput(
             message=evidence_text,
             extras={
+                "user:rag_state": _build_persistent_rag_state(ictx),
                 "_valid_kb_refs": refs,
                 "_rag_evidence_refs": evidence_refs,
                 "_rag_evidence_pack": {
@@ -1019,6 +1290,7 @@ class RagRetrievalWorkflow(Workflow):
                         "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
                         "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
                         "hints": ictx.instance_data.get("hints", {}),
+                        "retrieval_context": ictx.instance_data.get("retrieval_context") or {},
                     },
                     "route": ictx.instance_data.get("route"),
                     "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
@@ -1027,6 +1299,9 @@ class RagRetrievalWorkflow(Workflow):
                     "scope_count": ictx.instance_data.get("scope_count", 0),
                     "references": refs,
                     "evidence_count": len(ictx.instance_data.get("evidence", [])),
+                    "quality_evaluation": ictx.instance_data.get("quality_evaluation") or {},
+                    "quality_history": ictx.instance_data.get("quality_history") or [],
+                    "gap_ledger": ictx.instance_data.get("gap_ledger") or {},
                     "timings": ictx.instance_data.get("timings", {}),
                 },
                 "_rag_references": refs,
@@ -1037,9 +1312,13 @@ class RagRetrievalWorkflow(Workflow):
         """Retry exhausted but has partial results — emit what we have."""
         ctx = ictx.session_ctx
         ranked = ictx.instance_data.get("ranked") or []
+        partial_evidence = (
+            ictx.instance_data.get("evidence")
+            or ranked[:5]
+        )
 
         refs: list[dict[str, Any]] = []
-        for item in ranked[:5]:  # Limit partial results
+        for item in partial_evidence:
             ref = Reference(
                 chunk_id=item.get("chunk_id", item.get("id", "")),
                 doc_title=item.get("knowledge_title", ""),
@@ -1053,13 +1332,12 @@ class RagRetrievalWorkflow(Workflow):
 
         evidence_text = _build_evidence_text(
             ictx.instance_data.get("query", ""),
-            ranked[:5],  # Use ranked as evidence
+            partial_evidence,
             refs,
             query_plan=ictx.instance_data.get("rewrite") or {},
             selected_documents=ictx.instance_data.get("selected_documents") or [],
         )
 
-        partial_evidence = ranked[:5]
         evidence_refs = [
             {
                 "chunk_id": ev.get("chunk_id", ev.get("id", "")),
@@ -1068,9 +1346,16 @@ class RagRetrievalWorkflow(Workflow):
             }
             for ev in partial_evidence
         ]
+        quality = ictx.instance_data.get("quality_evaluation") or {}
+        missing_points = quality.get("missing_points") or []
+        quality_note = str(quality.get("reason") or "质量评估未通过").strip()
+        if missing_points:
+            quality_note += "；仍缺少：" + "；".join(str(item) for item in missing_points)
+        self._evidence_pools.pop(ictx.instance_id, None)
         return EffectOutput(
-            message=f"[部分结果] {evidence_text}",
+            message=f"[已达到最大检索轮数，以下为部分结果]\n评估说明：{quality_note}\n\n{evidence_text}",
             extras={
+                "user:rag_state": _build_persistent_rag_state(ictx),
                 "_valid_kb_refs": refs,
                 "_rag_evidence_refs": evidence_refs,
                 "_rag_evidence_pack": {
@@ -1084,6 +1369,7 @@ class RagRetrievalWorkflow(Workflow):
                         "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
                         "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
                         "hints": ictx.instance_data.get("hints", {}),
+                        "retrieval_context": ictx.instance_data.get("retrieval_context") or {},
                     },
                     "route": ictx.instance_data.get("route"),
                     "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
@@ -1091,8 +1377,11 @@ class RagRetrievalWorkflow(Workflow):
                     "document_read_stats": ictx.instance_data.get("document_read_stats", {}),
                     "scope_count": ictx.instance_data.get("scope_count", 0),
                     "references": refs,
-                    "evidence_count": len(ranked),
+                    "evidence_count": len(partial_evidence),
                     "partial": True,
+                    "quality_evaluation": ictx.instance_data.get("quality_evaluation") or {},
+                    "quality_history": ictx.instance_data.get("quality_history") or [],
+                    "gap_ledger": ictx.instance_data.get("gap_ledger") or {},
                     "timings": ictx.instance_data.get("timings", {}),
                 },
                 "_rag_references": refs,
@@ -1100,45 +1389,191 @@ class RagRetrievalWorkflow(Workflow):
         )
 
     async def _ef_expand_retry(self, ictx: InstanceCtx) -> EffectOutput | None:
-        """Expand search scope and retry — broaden sub_queries or rewrite."""
+        """Retry only the gaps returned by evidence quality evaluation."""
         ictx.instance_data["attempt"] = ictx.instance_data.get("attempt", 0) + 1
 
-        filters = ictx.instance_data.get("filters") or {}
+        quality = ictx.instance_data.get("quality_evaluation") or {}
+        retrieval_context = ictx.instance_data.get("retrieval_context") or {}
+        locked_documents = list(retrieval_context.get("selected_documents") or [])
+        reuse_locked_scope = bool(locked_documents) and not quality.get(
+            "requires_document_reselection",
+            False,
+        )
 
         # Reset downstream state for fresh run
-        ictx.instance_data["selected_knowledge_ids"] = []
+        ictx.instance_data["selected_documents"] = locked_documents if reuse_locked_scope else []
+        ictx.instance_data["selected_knowledge_ids"] = (
+            [document["knowledge_id"] for document in locked_documents]
+            if reuse_locked_scope
+            else []
+        )
+        ictx.instance_data["reuse_selected_documents"] = reuse_locked_scope
         ictx.instance_data["candidates"] = []
         ictx.instance_data["ranked"] = []
         ictx.instance_data["evidence"] = []
         ictx.instance_data["evidence_sufficient"] = False
         ictx.instance_data["references"] = []
-        # 文档级约束不可越界；其它场景可在既有 KB/tag/default 范围内放宽召回。
-        ictx.instance_data["allow_full_scope_recall"] = not _has_doc_scope(filters)
+        ictx.instance_data["allow_full_scope_recall"] = False
 
-        # Expand: add original query to sub_queries if not present
+        gap_ledger = ictx.instance_data.get("gap_ledger") or {}
+        retry_queries = [
+            item.strip()
+            for item in (gap_ledger.get("next_queries") or quality.get("retry_queries") or [])
+            if isinstance(item, str) and item.strip()
+        ]
+        retry_queries = _contextualize_retry_queries(
+            str(retrieval_context.get("premise") or ""),
+            retry_queries,
+        )
         rewrite = ictx.instance_data.get("rewrite") or {}
-        original_query = ictx.instance_data.get("query", "")
-        sub_queries = list(rewrite.get("sub_queries", []))
-        if original_query and original_query not in sub_queries:
-            sub_queries.append(original_query)
-        rewrite["sub_queries"] = sub_queries
+        if retry_queries:
+            # 原始文档证据已经保存在任务内 Evidence Pool。补查轮只执行带
+            # immutable premise 的缺口 query，避免重复跑首轮检索。
+            #
+            # 区分两种情形：
+            # 1) reuse_locked_scope=True —— 文档已锁定，doc_queries 不再用于 select，
+            #    保留原 doc_queries 作为语义参考，只把 sub_queries 换为 retry，
+            #    避免 select 内部意外写新性。
+            # 2) requires_document_reselection=True —— 需重选文档，两者都换。
+            deduped_retry = list(dict.fromkeys(retry_queries))
+            rewrite["sub_queries"] = deduped_retry
+            if not reuse_locked_scope:
+                rewrite["doc_queries"] = deduped_retry
+        else:
+            fallback_query = (
+                rewrite.get("analysis_query")
+                or rewrite.get("rewrite_query")
+                or ictx.instance_data.get("query", "")
+            )
+            rewrite["doc_queries"] = [fallback_query] if fallback_query else []
+            rewrite["sub_queries"] = [fallback_query] if fallback_query else []
         ictx.instance_data["rewrite"] = rewrite
 
-        logger.info(
-            "[RAG WF] retry attempt=%d, expanded sub_queries=%d",
-            ictx.instance_data["attempt"], len(sub_queries),
+        logger.debug(
+            "[RAG WF] retry attempt=%d reuse_locked_scope=%s missing=%s retry_queries=%s",
+            ictx.instance_data["attempt"],
+            reuse_locked_scope,
+            quality.get("missing_points", []),
+            rewrite.get("doc_queries", []),
         )
         return None
 
     async def _ef_mark_insufficient(self, ictx: InstanceCtx) -> EffectOutput | None:
-        logger.info("[RAG WF] Evidence insufficient, entering retry path")
+        logger.debug("[RAG WF] Evidence insufficient, entering retry path")
         return None
 
     async def _ef_mark_no_evidence(self, ictx: InstanceCtx) -> EffectOutput | None:
-        return EffectOutput(message="未找到相关内容。")
+        self._evidence_pools.pop(ictx.instance_id, None)
+        return EffectOutput(
+            message="未找到相关内容。",
+            extras={"user:rag_state": _build_persistent_rag_state(ictx)},
+        )
 
 
 # ── Evidence text builder ────────────────────────────────────────────────
+
+
+def _compact_document_scope(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only fields needed to lock and reuse the first-round document scope."""
+    compact: dict[str, dict[str, Any]] = {}
+    for document in documents:
+        knowledge_id = str(document.get("knowledge_id") or "").strip()
+        if not knowledge_id:
+            continue
+        compact[knowledge_id] = {
+            "knowledge_id": knowledge_id,
+            "knowledge_base_id": str(document.get("knowledge_base_id") or ""),
+            "knowledge_title": str(document.get("knowledge_title") or ""),
+            "file_name": str(document.get("file_name") or ""),
+            "score": float(document.get("score", 0.0) or 0.0),
+            "query_matches": [
+                {
+                    "query": str(match.get("query") or ""),
+                    "rank": int(match.get("rank", 0) or 0),
+                    "score": float(match.get("score", 0.0) or 0.0),
+                }
+                for match in document.get("query_matches", [])
+                if isinstance(match, dict)
+            ],
+            "document_match_scores": dict(document.get("document_match_scores") or {}),
+        }
+    return list(compact.values())
+
+
+def _build_persistent_rag_state(ictx: InstanceCtx) -> dict[str, Any]:
+    """Persist compact multi-turn RAG context in the single rag_state object."""
+    rag_state = dict(read_rag_state(ictx.session_ctx))
+    rewrite = ictx.instance_data.get("rewrite") or {}
+    retrieval = ictx.instance_data.get("retrieval_context") or {}
+    quality = ictx.instance_data.get("quality_evaluation") or {}
+    selected_documents = [
+        {
+            "knowledge_id": document.get("knowledge_id", ""),
+            "knowledge_base_id": document.get("knowledge_base_id", ""),
+            "knowledge_title": document.get("knowledge_title", ""),
+            "file_name": document.get("file_name", ""),
+            "score": document.get("score", 0.0),
+            "query_matches": document.get("query_matches", []),
+        }
+        for document in _compact_document_scope(
+            ictx.instance_data.get("selected_documents") or []
+        )
+    ]
+    rag_state["context"] = {
+        "resolved_query": (
+            rewrite.get("resolved_query")
+            or retrieval.get("conversation_summary")
+            or ictx.instance_data.get("query", "")
+        ),
+        "premise": retrieval.get("premise", ""),
+        "doc_query": rewrite.get("doc_query", ""),
+        "doc_queries": list(rewrite.get("doc_queries") or []),
+        "analysis_query": rewrite.get("analysis_query", ""),
+        "keywords": list(rewrite.get("keywords") or []),
+    }
+    rag_state["selected_documents"] = selected_documents
+    rag_state["last_quality"] = {
+        "round": int(quality.get("round", 0) or 0),
+        "score": float(quality.get("score", 0.0) or 0.0),
+        "passed": bool(quality.get("passed")),
+        "resolved_points": list(quality.get("resolved_points") or []),
+        "missing_points": list(quality.get("missing_points") or []),
+    }
+    return rag_state
+
+
+def _contextualize_retry_queries(premise: str, queries: list[Any]) -> list[str]:
+    """Attach the immutable first-round retrieval premise to gap queries."""
+    premise = (premise or "").strip()
+    result: list[str] = []
+    for item in queries:
+        if not isinstance(item, str):
+            continue
+        query = item.strip()
+        if not query:
+            continue
+        contextualized = query if not premise or premise in query else f"{premise} {query}"
+        if contextualized not in result:
+            result.append(contextualized)
+    return result
+
+
+def _merge_evidence_rounds(
+    archived: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge evidence from multiple retrieval rounds by chunk identity."""
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*archived, *current]:
+        identity = str(item.get("chunk_id") or item.get("id") or "").strip()
+        if not identity:
+            identity = f"{item.get('knowledge_id', '')}:{item.get('chunk_index', '')}:{len(merged)}"
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(item)
+    return merged
 
 
 def _select_evidence_by_document(
@@ -1159,12 +1594,13 @@ def _select_evidence_by_document(
         )
         groups.setdefault(group_key, []).append(item)
 
-    def _priority(item: dict[str, Any]) -> tuple[int, float, int]:
+    def _priority(item: dict[str, Any]) -> tuple[int, int, float, int]:
         score = max(
             float(item.get("score", 0.0) or 0.0),
             float(item.get("anchor_score", 0.0) or 0.0),
         )
         return (
+            -int(item.get("_quality_round", 0) or 0),
             0 if item.get("is_anchor") else 1,
             -score,
             int(item.get("chunk_index", 0) or 0),
@@ -1219,9 +1655,9 @@ def _build_evidence_text(
         f"当前日期: {time.strftime('%Y-%m-%d')}",
         f"查询: {query}",
         f"找到 {len(evidence)} 条证据，{len(references)} 条引用",
-        "回答约束: 只能使用下方证据原文中的事实、数字和结论；证据中没有的信息必须说明未检索到，不得用常识或记忆补全。",
+        "回答约束: 只能使用下方证据原文中的事实、数字和结论；不得用常识或记忆补全。",
         "推断约束: 不得使用“预计、推测、可能仍会、初步判断”等措辞补足缺失数据；趋势和优劣结论必须由跨期事实直接支撑。",
-        "缺失表述约束: 本次证据未覆盖某项信息，不等于知识库不存在该信息。除非证据明确证明，否则只能说“本次检索证据未覆盖”，不得断言“知识库中没有/缺少某文档”。",
+        "体裁约束: 证据能支撑分析时，直接给出结论、数据和对比，不得写成“关于 XX 的说明”一类免责体。数据边界、口径差异或未覆盖项只能在文末以“注:”开头的一句话简短提及，不得作为章节标题、小节或大段落展开。",
         "引用方式: 在对应文字末尾用 [N] 标注证据编号（如 [1]、[2]），同一来源复用同一编号。禁止使用 <kb> 等其它引用格式。",
         "",
     ]
@@ -1251,7 +1687,7 @@ def _build_evidence_text(
         if kid and title:
             kid_title_map[kid] = title
 
-    max_evidence = max(1, int(os.getenv("RAG_EVIDENCE_MAX_CHUNKS", "12")))
+    max_evidence = max(1, int(os.getenv("RAG_EVIDENCE_MAX_CHUNKS", "30")))
     per_chunk_chars = int(os.getenv("RAG_EVIDENCE_SNIPPET_CHARS", "1200"))
     total_budget = max(2000, int(os.getenv("RAG_EVIDENCE_MAX_TOTAL_CHARS", "12000")))
     used_chars = sum(len(line) + 1 for line in lines)

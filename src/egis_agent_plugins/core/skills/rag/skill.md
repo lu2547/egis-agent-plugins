@@ -23,8 +23,8 @@ chunk，随后 rerank/MMR，并按文档大小决定通读或关联扩展。
 
 `hints` 是你对用户意图的语义判断，只作为系统策略的输入提示，最终执行由 workflow 决定。
 
-- 用户明确提到文件名、报告名、PDF、附件、制度名，或“基于/根据 + 某类报告/摘要/材料/最近N年报告”时，`document_match_preference="filename"`。
-- 用户没有明确文件名，只描述主题、趋势、优劣、原因、对比时，`document_match_preference="summary"`。
+- 用户 query 里出现具体文件名、报告名、PDF/DOCX 后缀、附件、制度名，或“基于/根据 + 某类报告/摘要/材料/文件”这类明确的文件名字面词时，`document_match_preference="filename"`。注意：“近N年 / 2023-2025 年”这类时间范围只是限定跨度，不算文件名信号；只有当 query 同时出现“报告/摘要/材料/文件”等字面词时才算。
+- 用户没有明确文件名，只描述主题、趋势、优劣、原因、对比时（即使带“近N年”、具体年份区间或具体主体名称），`document_match_preference="summary"`。
 - 用户既提文件又问复杂主题时，`document_match_preference="balanced"`。
 - 用户说“总结全文 / 通读 / 基于整篇 / 提炼全文”时，`read_preference="full_document"`。
 - 用户问“哪一条 / 某个指标 / 定义 / 时间 / 金额 / 是否包含”时，`read_preference="related_chunks"`。
@@ -76,7 +76,23 @@ rag(
   hints={
     "document_match_preference": "filename",
     "read_preference": "mixed",
-    "reason": "用户明确要求基于最近3年的数据摘要报告，核心是先定位对应年度的数据摘要报告文档，再在文档内分析平安养老险"
+    "reason": "query 同时出现“数据摘要报告”这类文件名字面词 + 时间限定，filename 信号明确，需先定位对应年度的数据摘要报告文档，再在文档内分析平安养老险"
+  }
+)
+```
+
+用户：分析近三年平安养老险客户数（参加人数、参保人数）的变化趋势
+
+调用：
+
+```text
+rag(
+  query="分析近三年平安养老险客户数（参加人数、参保人数）的变化趋势",
+  source="internal",
+  hints={
+    "document_match_preference": "summary",
+    "read_preference": "mixed",
+    "reason": "query 仅含时间范围（近三年）+ 业务主体（平安养老险）+ 指标（客户数），未出现“报告/摘要/文件/PDF”等文件名字面词，时间范围不算 filename 信号，按主题走 summary"
   }
 )
 ```
@@ -151,7 +167,7 @@ rag(
 ## 回答约束
 
 - 只使用 `rag` 返回的证据包回答。
-- 证据中没有的信息，明确说明未检索到；不要用常识或记忆补全。
+- 证据中没有的信息不要用常识或记忆补全；必要时在文末以“注：”开头统一说明数据边界。
 - 新问题默认重新检索；只有用户明确说“继续、上述、刚才、基于上一轮”时，才可承接上一轮。
 - 面向用户自然表达，不暴露内部工具链、chunk ID 以外的技术细节。
 - 本轮结束必须调用 `final_answer`。

@@ -29,70 +29,132 @@ async def _apply_rerank(
 
     head = [dict(c) for c in candidates[:rerank_topn]]
     tail = candidates[rerank_topn:]
-    query = " ".join(q for q in queries if q)
     passages = [c.get("content", "") for c in head]
 
-    try:
-        rerank_results = await asyncio.wait_for(
-            clients.rerank.rerank(query, passages),
-            timeout=rerank_timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "[Rank] rerank 超时 %.1fs (候选 %d 条)，保留召回原序",
-            rerank_timeout,
-            len(head),
-        )
+    effective_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
+    if not effective_queries:
         return candidates
-    except Exception as e:
-        logger.warning("[Rank] rerank failed: %s; keep recall order", e)
+    default_concurrency = os.getenv("RAG_RETRIEVAL_CONCURRENCY", "6")
+    sem = asyncio.Semaphore(max(
+        1,
+        int(os.getenv("RAG_RERANK_QUERY_CONCURRENCY", default_concurrency)),
+    ))
+
+    async def _rerank_one(query: str) -> tuple[str, list[Any]]:
+        async with sem:
+            results = await asyncio.wait_for(
+                clients.rerank.rerank(query, passages),
+                timeout=rerank_timeout,
+            )
+        return query, results
+
+    query_results = await asyncio.gather(
+        *(_rerank_one(query) for query in effective_queries),
+        return_exceptions=True,
+    )
+    merged: dict[int, dict[str, Any]] = {}
+    successful_queries = 0
+    for result in query_results:
+        if isinstance(result, asyncio.TimeoutError):
+            logger.warning(
+                "[Rank] one query rerank timed out after %.1fs; continuing other queries",
+                rerank_timeout,
+            )
+            continue
+        if isinstance(result, Exception):
+            logger.warning("[Rank] one query rerank failed: %s", result)
+            continue
+        query, rerank_results = result
+        successful_queries += 1
+        for query_rank, rr in enumerate(rerank_results, 1):
+            if not 0 <= rr.index < len(head):
+                continue
+            entry = merged.get(rr.index)
+            if entry is None:
+                entry = dict(head[rr.index])
+                entry["rerank_query_matches"] = []
+                merged[rr.index] = entry
+            entry["rerank_query_matches"].append({
+                "query": query,
+                "rank": query_rank,
+                "score": float(rr.score or 0.0),
+            })
+            if float(rr.score or 0.0) >= float(entry.get("rerank_score", 0.0) or 0.0):
+                entry["score"] = rr.score
+                entry["rerank_score"] = rr.score
+                entry["rerank_query"] = query
+            entry["reranked"] = True
+
+    if not successful_queries:
         return candidates
+    accepted = sorted(
+        merged.values(),
+        key=lambda item: float(item.get("rerank_score", 0.0) or 0.0),
+        reverse=True,
+    )
 
-    accepted: list[dict[str, Any]] = []
-    accepted_indices: set[int] = set()
-    for rr in rerank_results:
-        if 0 <= rr.index < len(head):
-            item = head[rr.index]
-            item["score"] = rr.score
-            item["rerank_score"] = rr.score
-            item["reranked"] = True
-            accepted.append(item)
-            accepted_indices.add(rr.index)
-
-    logger.info(
+    logger.debug(
         "[Rank] rerank accepted=%d dropped=%d tail_dropped=%d",
         len(accepted),
-        len(head) - len(accepted),
+        len(head) - len(merged),
         len(tail),
     )
     for item in accepted:
-        logger.info(
+        logger.debug(
             "[Rank] ✔ %s  score=%.4f  knowledge_id=%s",
             item.get("file_name", "unknown"),
             item.get("rerank_score", 0.0),
             item.get("knowledge_id", ""),
         )
-    for i, item in enumerate(head):
-        if i not in accepted_indices:
-            logger.info(
-                "[Rank] ✘ %s  (dropped by rerank/threshold)  knowledge_id=%s",
-                item.get("file_name", "unknown"),
-                item.get("knowledge_id", ""),
-            )
     return accepted
 
 
 def _apply_diversity(candidates: list[dict[str, Any]], *, top_k: int) -> list[dict[str, Any]]:
     if top_k <= 0 or len(candidates) <= top_k:
         return candidates
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[int] = set()
+    query_order = list(dict.fromkeys(
+        str(match.get("query") or "")
+        for candidate in candidates
+        for match in candidate.get("rerank_query_matches", [])
+        if str(match.get("query") or "")
+    ))
+    for query in query_order:
+        matching = [
+            item
+            for item in candidates
+            if id(item) not in selected_ids
+            and any(
+                match.get("query") == query
+                for match in item.get("rerank_query_matches", [])
+            )
+        ]
+        candidate = max(
+            matching,
+            key=lambda item: max(
+                float(match.get("score", 0.0) or 0.0)
+                for match in item.get("rerank_query_matches", [])
+                if match.get("query") == query
+            ),
+            default=None,
+        )
+        if candidate is None:
+            continue
+        selected.append(candidate)
+        selected_ids.add(id(candidate))
+        if len(selected) >= top_k:
+            return selected
+
+    remaining = [item for item in candidates if id(item) not in selected_ids]
     mmr_results = apply_mmr(
-        candidates,
+        remaining,
         relevance_fn=lambda c: float(c.get("score", 0.0)),
         content_fn=lambda c: c.get("content", ""),
-        k=top_k,
+        k=top_k - len(selected),
         lambda_=float(os.getenv("RAG_MMR_LAMBDA", "0.7")),
     )
-    return mmr_results or candidates[:top_k]
+    return [*selected, *(mmr_results or remaining[: top_k - len(selected)])]
 
 
 async def run(
@@ -115,7 +177,7 @@ async def run(
     ranked = _apply_diversity(reranked, top_k=top_k)
 
     elapsed = int((time.perf_counter() - t0) * 1000)
-    logger.info(
+    logger.debug(
         "[Rank] candidates=%d accepted=%d ranked=%d cost_ms=%d",
         len(candidates),
         len(reranked),

@@ -33,6 +33,7 @@ from egis_agent_plugins.core.internal.a2ui import (
     ToolDisplayType,
     apply_dual_layer,
 )
+from egis_agent_plugins.core.flows.rag.schema import DEFAULT_QUALITY_MAX_RETRIES
 from egis_agent_plugins.core.flows.rag.clients import RAGClients
 
 from ._services.scope_adapter import read_rag_state
@@ -102,20 +103,13 @@ class RagTool(AgentTool):
             ),
             required=False,
         ),
-        ToolParameter(
-            name="max_retries",
-            type="integer",
-            description="证据不足时的最大重试次数（默认 1）",
-            required=False,
-            default=1,
-        ),
     ]
 
     # data_source: RAG 工具产出 evidence，计入 citation 统计
     data_source = True
 
     # 声明写入 session.state 的 keys
-    output_state_keys = ("_rag_evidence_pack", "_rag_references")
+    output_state_keys = ("_rag_evidence_pack", "_rag_references", "user:rag_state")
 
     def __init__(self, *, clients: RAGClients) -> None:
         self._clients = clients
@@ -157,6 +151,29 @@ class RagTool(AgentTool):
         scopes = [item for item in raw if isinstance(item, dict)]
         return scopes or None
 
+    @staticmethod
+    def _read_previous_rag_context(ctx: dict[str, Any]) -> dict[str, Any]:
+        """Read only the compact multi-turn context persisted in rag_state."""
+        rag_state = read_rag_state(ctx)
+        context = rag_state.get("context") if isinstance(rag_state.get("context"), dict) else {}
+        documents = (
+            rag_state.get("selected_documents")
+            if isinstance(rag_state.get("selected_documents"), list)
+            else []
+        )
+        last_quality = (
+            rag_state.get("last_quality")
+            if isinstance(rag_state.get("last_quality"), dict)
+            else {}
+        )
+        if not context and not documents:
+            return {}
+        return {
+            "context": context,
+            "selected_documents": [item for item in documents if isinstance(item, dict)],
+            "last_quality": last_quality,
+        }
+
     @classmethod
     def _inject_frontend_filters(
         cls,
@@ -173,18 +190,24 @@ class RagTool(AgentTool):
 
         filters = {"rag_filter": rag_filter}
         args["filters"] = filters
-        logger.info("[RagRetrieval] injected frontend rag_filter into tool filters: scopes=%d", len(rag_filter))
+        # 方案 C 兜底:前端已圈定资料时，LLM 不再需要靠 filename 去筛文件，
+        # 默认走 summary。避免 B 短路阈值超限时走旧路径，constraint kill 把用户
+        # 圈定的文件全禁掉。LLM 已显式传入 hints 时不覆盖。
+        hints_raw = args.get("hints")
+        hints = hints_raw if isinstance(hints_raw, dict) else {}
+        if not str(hints.get("document_match_preference") or "").strip():
+            hints["document_match_preference"] = "summary"
+            args["hints"] = hints
+            logger.info(
+                "[RagRetrieval] frontend rag_filter present, defaulting hints.document_match_preference=summary",
+            )
+        else:
+            args["hints"] = hints
+        logger.debug(
+            "[RagRetrieval] injected frontend rag_filter into tool filters: scopes=%d",
+            len(rag_filter),
+        )
         return filters
-
-    @staticmethod
-    def _parse_int(raw: Any, *, default: int = 0) -> int:
-        """Parse an integer from a possibly-string value."""
-        if raw is None:
-            return default
-        try:
-            return int(raw)
-        except (ValueError, TypeError):
-            return default
 
     @staticmethod
     def _slim_state_delta(state_delta: dict[str, Any]) -> dict[str, Any]:
@@ -209,11 +232,16 @@ class RagTool(AgentTool):
             "score": round(float(doc.get("score", 0.0) or 0.0), 4),
             "filename": round(float(scores.get("filename", 0.0) or 0.0), 4),
             "summary": round(float(scores.get("summary", 0.0) or 0.0), 4),
-            "initial_recall": round(float(scores.get("recall", 0.0) or 0.0), 4),
-            "initial_recall_components": doc.get("initial_recall_components", {}),
-            "filename_source": scores.get("filename_source", ""),
-            "summary_source": scores.get("summary_source", ""),
-            "score_source": scores.get("score_source", ""),
+            "constraint_matched": bool(scores.get("constraint_matched", True)),
+            "query_matches": [
+                {
+                    "query": match.get("query", ""),
+                    "rank": int(match.get("rank", 0) or 0),
+                    "score": round(float(match.get("score", 0.0) or 0.0), 4),
+                }
+                for match in doc.get("query_matches", [])
+                if isinstance(match, dict)
+            ],
         }
 
     @staticmethod
@@ -226,61 +254,124 @@ class RagTool(AgentTool):
         )
         return next(iter(data.values())).get("data", {}) if data else {}
 
+    @staticmethod
+    def _ranked_document_summary(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for item in ranked:
+            knowledge_id = str(item.get("knowledge_id") or "")
+            key = knowledge_id or str(item.get("knowledge_title") or "unknown")
+            entry = grouped.setdefault(
+                key,
+                {
+                    "title": item.get("knowledge_title") or item.get("file_name") or knowledge_id,
+                    "kid": knowledge_id,
+                    "chunk_count": 0,
+                },
+            )
+            entry["chunk_count"] += 1
+        return sorted(
+            grouped.values(),
+            key=lambda item: (-int(item["chunk_count"]), str(item["title"])),
+        )
+
+    @classmethod
+    def _set_rewrite_trace_attrs(
+        cls,
+        span: Any,
+        state_delta: dict[str, Any] | None,
+        step_args: dict[str, Any] | None,
+    ) -> None:
+        try:
+            instance_data = cls._instance_data_from_state_delta(state_delta)
+            rewrite = instance_data.get("rewrite") or {}
+            span.set_attribute("rag.rewrite.input", str((step_args or {}).get("query") or ""))
+            span.set_attribute(
+                "rag.rewrite.result",
+                json.dumps(
+                    {
+                        "intent": rewrite.get("intent", ""),
+                        "resolved_query": rewrite.get("resolved_query", ""),
+                        "continues_previous_rag": bool(
+                            rewrite.get("continues_previous_rag")
+                        ),
+                        "reuse_previous_documents": bool(
+                            rewrite.get("reuse_previous_documents")
+                        ),
+                        "rewrite_query": rewrite.get("rewrite_query", ""),
+                        "doc_query": rewrite.get("doc_query", ""),
+                        "doc_queries": rewrite.get("doc_queries", []),
+                        "analysis_query": rewrite.get("analysis_query", ""),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+        except Exception:
+            logger.debug("[RagRetrieval] failed to set rewrite trace attrs", exc_info=True)
+
     @classmethod
     def _set_branch_recall_trace_attrs(cls, span: Any, state_delta: dict[str, Any] | None) -> None:
         try:
             instance_data = cls._instance_data_from_state_delta(state_delta)
             selected = instance_data.get("selected_documents") or []
-            rejected = instance_data.get("rejected_documents") or []
-            excluded = instance_data.get("excluded_documents") or []
+            rewrite = instance_data.get("rewrite") or {}
             span.set_attribute(
-                "rag.document_read_mode",
-                instance_data.get("document_read_mode") or "global_chunk_rerank",
+                "rag.document_select.queries",
+                json.dumps(rewrite.get("doc_queries") or [], ensure_ascii=False, default=str),
             )
+            selected_items = []
+            for rank, document in enumerate(selected, 1):
+                item = cls._doc_trace_item(document)
+                item["rank"] = rank
+                selected_items.append(item)
             span.set_attribute(
-                "rag.doc.strategy",
-                json.dumps(instance_data.get("document_match_strategy") or {}, ensure_ascii=False, default=str),
+                "rag.document_select.selected",
+                json.dumps(selected_items, ensure_ascii=False, default=str),
             )
-            span.set_attribute(
-                "rag.doc.thresholds",
-                json.dumps(instance_data.get("document_select_thresholds") or {}, ensure_ascii=False, default=str),
-            )
-            span.set_attribute(
-                "rag.doc.selected",
-                json.dumps([cls._doc_trace_item(doc) for doc in selected[:10]], ensure_ascii=False, default=str),
-            )
-            span.set_attribute(
-                "rag.doc.rejected",
-                json.dumps([cls._doc_trace_item(doc) for doc in rejected[:10]], ensure_ascii=False, default=str),
-            )
-            span.set_attribute(
-                "rag.doc.excluded",
-                json.dumps([cls._doc_trace_item(doc) for doc in excluded[:10]], ensure_ascii=False, default=str),
-            )
-            span.set_attribute("rag.doc.selected_count", len(selected))
-            span.set_attribute("rag.doc.rejected_count", len(rejected))
-            span.set_attribute("rag.doc.excluded_count", len(excluded))
+            span.set_attribute("rag.document_select.selected_count", len(selected_items))
         except Exception:
             logger.debug("[RagRetrieval] failed to set branch recall trace attrs", exc_info=True)
 
     @classmethod
-    def _set_read_trace_attrs(cls, span: Any, state_delta: dict[str, Any] | None) -> None:
+    def _set_rank_trace_attrs(cls, span: Any, state_delta: dict[str, Any] | None) -> None:
         try:
             instance_data = cls._instance_data_from_state_delta(state_delta)
+            by_document = cls._ranked_document_summary(instance_data.get("ranked") or [])
             span.set_attribute(
-                "rag.document_read_mode",
-                instance_data.get("document_read_mode") or "global_chunk_rerank",
+                "rag.chunk_rerank.by_document",
+                json.dumps(by_document, ensure_ascii=False, default=str),
+            )
+            span.set_attribute("rag.chunk_rerank.selected_count", sum(item["chunk_count"] for item in by_document))
+        except Exception:
+            logger.debug("[RagRetrieval] failed to set rank trace attrs", exc_info=True)
+
+    @classmethod
+    def _set_quality_trace_attrs(cls, span: Any, state_delta: dict[str, Any] | None) -> None:
+        try:
+            instance_data = cls._instance_data_from_state_delta(state_delta)
+            quality = instance_data.get("quality_evaluation") or {}
+            span.set_attribute("rag.quality.round", int(quality.get("round", 0) or 0))
+            span.set_attribute("rag.quality.score", float(quality.get("score", 0.0) or 0.0))
+            span.set_attribute("rag.quality.passed", bool(quality.get("passed")))
+            span.set_attribute("rag.quality.result", str(quality.get("reason") or ""))
+            span.set_attribute(
+                "rag.quality.executed_queries",
+                json.dumps(quality.get("executed_queries") or [], ensure_ascii=False, default=str),
             )
             span.set_attribute(
-                "rag.document_read_plan",
-                json.dumps(instance_data.get("document_read_plan") or [], ensure_ascii=False, default=str),
+                "rag.quality.missing_points",
+                json.dumps(quality.get("missing_points") or [], ensure_ascii=False, default=str),
             )
             span.set_attribute(
-                "rag.document_read_stats",
-                json.dumps(instance_data.get("document_read_stats") or {}, ensure_ascii=False, default=str),
+                "rag.quality.next_queries",
+                json.dumps(quality.get("retry_queries") or [], ensure_ascii=False, default=str),
+            )
+            span.set_attribute(
+                "rag.quality.requires_document_reselection",
+                bool(quality.get("requires_document_reselection")),
             )
         except Exception:
-            logger.debug("[RagRetrieval] failed to set read trace attrs", exc_info=True)
+            logger.debug("[RagRetrieval] failed to set quality trace attrs", exc_info=True)
 
     async def execute(
         self,
@@ -296,12 +387,12 @@ class RagTool(AgentTool):
         source = args.get("source", "auto")
         filters = self._inject_frontend_filters(args=args, ctx=ctx)
         hints = self._parse_filters(args.get("hints"))
-        max_retries = self._parse_int(args.get("max_retries"), default=1)
+        max_retries = DEFAULT_QUALITY_MAX_RETRIES
 
         if not query.strip():
             return AgentToolResult.error_result(tool_call.id, "query 参数不能为空")
 
-        logger.info(
+        logger.debug(
             "[RagRetrieval] query=%s, source=%s, max_retries=%d",
             query[:80], source, max_retries,
         )
@@ -334,28 +425,17 @@ class RagTool(AgentTool):
         async def _step(action: str, step_args: dict[str, Any] | None = None) -> Any:
             with _tracer.start_as_current_span(f"rag.{action}") as span:
                 span.set_attribute("rag.action", action)
-                if step_args:
-                    try:
-                        span.set_attribute("input.value", json.dumps(step_args, ensure_ascii=False, default=str)[:2000])
-                    except Exception:
-                        pass
                 result = await flow.execute(iid, action, step_args or {}, ctx)
                 span.set_attribute("rag.success", result.success)
                 span.set_attribute("rag.new_state", result.new_state or "")
+                if action == "rewrite":
+                    self._set_rewrite_trace_attrs(span, result.state_delta, step_args)
                 if action == "branch_recall":
                     self._set_branch_recall_trace_attrs(span, result.state_delta)
+                if action == "rank":
+                    self._set_rank_trace_attrs(span, result.state_delta)
                 if action == "read":
-                    self._set_read_trace_attrs(span, result.state_delta)
-                try:
-                    output_payload = {
-                        "success": result.success,
-                        "new_state": result.new_state,
-                        "message": result.message,
-                        "state_delta": result.state_delta,
-                    }
-                    span.set_attribute("output.value", json.dumps(output_payload, ensure_ascii=False, default=str))
-                except Exception:
-                    pass
+                    self._set_quality_trace_attrs(span, result.state_delta)
                 if not result.success:
                     span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, result.digest or "step failed"))
                 else:
@@ -396,6 +476,8 @@ class RagTool(AgentTool):
         # ── Step 1: rewrite/router ──
         initial_args = {
             "query": query,
+            "current_user_input": str(ctx.get("temp:user_input") or query),
+            "previous_rag_context": self._read_previous_rag_context(ctx),
             "source": source,
             "filters": filters,
             "hints": hints,
@@ -472,7 +554,7 @@ class RagTool(AgentTool):
                 tool="rag",
                 status="ok" if flow_result.new_state == "answer_ready" else "partial",
                 summary=f"检索完成: {ref_count} 引用, {evidence_count} 证据, {total_ms}ms",
-                state_keys=("_rag_evidence_pack", "_rag_references"),
+                state_keys=("_rag_evidence_pack", "_rag_references", "user:rag_state"),
             ),
         )
 
@@ -499,7 +581,7 @@ class RagTool(AgentTool):
             ),
         )
         apply_dual_layer(result, digest, message)
-        logger.info(
+        logger.debug(
             "[RAG_TOOL] final_result content_chars=%d llm_digest_chars=%d refs=%d evidence=%d",
             len(str(result.content or "")),
             len(result.llm_digest or ""),
@@ -548,13 +630,16 @@ class RagTool(AgentTool):
         ctx: dict[str, Any],
     ) -> AgentToolResult:
         message = flow_result.message or "未找到相关内容。"
+        state_delta = self._slim_state_delta(flow_result.state_delta or {})
         result = AgentToolResult.text_result(
             tool_call_id=tool_call_id,
             text=message,
+            metadata={"state_delta": state_delta} if state_delta else {},
             llm_digest=ToolDigest(
                 tool="rag",
                 status="partial",
                 summary="未找到相关内容",
+                state_keys=("user:rag_state",),
             ),
         )
         digest = FrontendDigest(

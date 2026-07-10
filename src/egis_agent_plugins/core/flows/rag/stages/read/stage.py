@@ -131,12 +131,12 @@ async def run(
                 return {"error": f"未找到名为 '{file_name}' 的文档"}
             knowledge_id = resolved.knowledge_ids[0]
             if len(resolved.knowledge_ids) > 1:
-                logger.info(
+                logger.debug(
                     "[ListChunks] file_name=%s 命中 %d 个文档，取首个 knowledge_id=%s",
                     file_name, len(resolved.knowledge_ids), knowledge_id,
                 )
 
-        logger.info(
+        logger.debug(
             "[ListChunks] knowledge_id=%s, limit=%d, offset=%d", knowledge_id, limit, offset
         )
 

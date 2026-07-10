@@ -527,7 +527,7 @@ async def _read_from_anchors(
         "final_dedup_skipped": final_dedup_skipped,
         **expand_stats,
     }
-    logger.info(
+    logger.debug(
         "[DocumentReader] docs=%d small=%d large=%d anchors=%d evidence=%d processed=%d final_dedup_skipped=%d",
         len(doc_order),
         len(small_doc_ids),
@@ -556,7 +556,7 @@ async def read_ranked_context(
         anchors=ranked,
         top_k=top_k,
     )
-    logger.info("[DocumentReader] ranked=%d evidence=%d", len(ranked), len(evidence))
+    logger.debug("[DocumentReader] ranked=%d evidence=%d", len(ranked), len(evidence))
     return evidence
 
 
@@ -585,7 +585,7 @@ async def read_selected_documents_context(
         top_k=None,
     )
     stats["document_read_mode"] = "per_document_read"
-    logger.info(
+    logger.debug(
         "[RAG_READ_STRATEGY] mode=per_document_read selected_docs=%d small=%d large=%d anchors=%d evidence=%d",
         len(selected_documents),
         len(stats.get("small_doc_ids", [])),

@@ -60,7 +60,7 @@ class EmbeddingService:
                 base_url=cfg.embedding_base_url or None,
                 http_client=http_client,
             )
-            logger.info(
+            logger.debug(
                 "[Embedding] Using PA-JT provider (model=%s, base_url=%s)",
                 cfg.embedding_model,
                 cfg.embedding_base_url,
@@ -70,7 +70,7 @@ class EmbeddingService:
                 api_key=cfg.embedding_api_key,
                 base_url=cfg.embedding_base_url or None,
             )
-            logger.info(
+            logger.debug(
                 "[Embedding] Using OpenAI provider (model=%s, base_url=%s)",
                 cfg.embedding_model,
                 cfg.embedding_base_url,

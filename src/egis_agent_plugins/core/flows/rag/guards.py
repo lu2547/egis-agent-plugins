@@ -14,6 +14,7 @@ import os
 
 from ark_agentic.core.workflow.errors import WorkflowRejection
 from ark_agentic.core.workflow.protocol import InstanceCtx
+from .schema import DEFAULT_QUALITY_MAX_RETRIES
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +215,9 @@ def _can_retry(ictx: InstanceCtx) -> None:
     if ictx.probing:
         return
     attempt = ictx.instance_data.get("attempt", 0)
-    max_retries = ictx.instance_data.get("max_retries", 1)
+    max_retries = ictx.instance_data.get("max_retries", DEFAULT_QUALITY_MAX_RETRIES)
+    if ictx.instance_data.get("retry_stalled"):
+        raise WorkflowRejection(code="guard", message="retry planner produced no new query")
     if attempt < max_retries:
         return
     raise WorkflowRejection(
@@ -224,14 +227,18 @@ def _can_retry(ictx: InstanceCtx) -> None:
 
 
 def _retry_exhausted_has_partial(ictx: InstanceCtx) -> None:
-    """重试耗尽但 ranked 非空 → 用部分结果。"""
+    """重试耗尽但仍有证据或候选 → 用部分结果。"""
     if ictx.probing:
         return
     attempt = ictx.instance_data.get("attempt", 0)
-    max_retries = ictx.instance_data.get("max_retries", 1)
-    if attempt >= max_retries:
-        ranked = ictx.instance_data.get("ranked") or []
-        if ranked:
+    max_retries = ictx.instance_data.get("max_retries", DEFAULT_QUALITY_MAX_RETRIES)
+    if attempt >= max_retries or ictx.instance_data.get("retry_stalled"):
+        partial = (
+            ictx.instance_data.get("evidence")
+            or ictx.instance_data.get("ranked")
+            or []
+        )
+        if partial:
             return
     raise WorkflowRejection(
         code="guard",
@@ -240,14 +247,18 @@ def _retry_exhausted_has_partial(ictx: InstanceCtx) -> None:
 
 
 def _retry_exhausted_no_evidence(ictx: InstanceCtx) -> None:
-    """重试耗尽且 ranked 为空 → no_evidence。"""
+    """重试耗尽且没有任何部分证据 → no_evidence。"""
     if ictx.probing:
         return
     attempt = ictx.instance_data.get("attempt", 0)
-    max_retries = ictx.instance_data.get("max_retries", 1)
-    if attempt >= max_retries:
-        ranked = ictx.instance_data.get("ranked") or []
-        if not ranked:
+    max_retries = ictx.instance_data.get("max_retries", DEFAULT_QUALITY_MAX_RETRIES)
+    if attempt >= max_retries or ictx.instance_data.get("retry_stalled"):
+        partial = (
+            ictx.instance_data.get("evidence")
+            or ictx.instance_data.get("ranked")
+            or []
+        )
+        if not partial:
             return
     raise WorkflowRejection(
         code="guard",

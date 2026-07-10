@@ -31,6 +31,7 @@ _TOOL_LABELS = {
     "web_search": "检索网络资料",
     "rank": "融合与精排",
     "read": "读取证据上下文",
+    "quality_evaluate": "评估证据质量",
     "references": "整理引用来源",
 }
 

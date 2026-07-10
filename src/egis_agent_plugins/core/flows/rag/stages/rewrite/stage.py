@@ -44,6 +44,12 @@ async def run(
     history = args.get("history")
     language = args.get("language") or "zh-CN"
     pinned = args.get("pinned_knowledge_ids")
+    current_user_input = str(args.get("current_user_input") or "").strip()
+    previous_rag_context = (
+        args.get("previous_rag_context")
+        if isinstance(args.get("previous_rag_context"), dict)
+        else {}
+    )
 
     try:
         service = _get_service()
@@ -58,7 +64,12 @@ async def run(
 
     try:
         result = await service.rewrite(
-            query, history=history, language=language, pinned_knowledge_ids=pinned,
+            query,
+            history=history,
+            language=language,
+            pinned_knowledge_ids=pinned,
+            current_user_input=current_user_input,
+            previous_rag_context=previous_rag_context,
         )
     except Exception as e:
         logger.warning("[QueryRewrite] rewrite 失败，使用原始 query: %s", e)

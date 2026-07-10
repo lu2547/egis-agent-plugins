@@ -99,7 +99,7 @@ def inject_rag_scope_into_tool_calls(ctx: Any, response: AgentMessage) -> bool:
         changed = _inject_tool_call(tool_call, rag_filter) or changed
 
     if changed:
-        logger.info(
+        logger.debug(
             "[RagRetrieval] injected frontend rag_filter into model tool_calls: scopes=%d",
             len(rag_filter),
         )
