@@ -55,6 +55,8 @@ class RewriteResult:
     keywords: list[str] = field(default_factory=list)
     doc_query: str = ""
     analysis_query: str = ""
+    # 文档选择专用的独立查询计划，不受通用 sub_queries 上限影响。
+    doc_queries: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,7 +66,28 @@ class RewriteResult:
             "keywords": self.keywords,
             "doc_query": self.doc_query,
             "analysis_query": self.analysis_query,
+            "doc_queries": self.doc_queries,
         }
+
+
+def _normalize_doc_queries(
+    value: Any,
+    *,
+    fallback_query: str,
+) -> list[str]:
+    """Validate the single supported ``doc_queries: string[]`` contract."""
+    items = value if isinstance(value, list) else []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        query = item.strip()
+        if not query or query in seen:
+            continue
+        seen.add(query)
+        normalized.append(query)
+    return normalized or [fallback_query]
 
 
 # ── 服务实现 ──────────────────────────────────────────────────────────
@@ -141,6 +164,7 @@ class QueryRewriteService:
                 keywords=self._extract_simple_keywords(query),
                 doc_query=query,
                 analysis_query=query,
+                doc_queries=[query],
             )
 
         try:
@@ -253,9 +277,14 @@ class QueryRewriteService:
                 doc_query = rewrite_query
             if not analysis_query:
                 analysis_query = original_query
+            doc_queries = _normalize_doc_queries(
+                data.get("doc_queries"),
+                fallback_query=doc_query,
+            )
         else:
             doc_query = ""
             analysis_query = ""
+            doc_queries = []
 
         return RewriteResult(
             rewrite_query=rewrite_query,
@@ -264,6 +293,7 @@ class QueryRewriteService:
             keywords=keywords[:5],
             doc_query=doc_query,
             analysis_query=analysis_query,
+            doc_queries=doc_queries,
         )
 
     @staticmethod
@@ -271,5 +301,5 @@ class QueryRewriteService:
         """简单关键词提取（不依赖 LLM）"""
         import re
         # 去除标点，按空格/标点分词，取长度>=2的片段
-        tokens = re.split(r'[\s,，。！？、；：""''（）()\[\]{}]+', query)
+        tokens = re.split(r"[\s,，。！？、；：‘’“”\"'（）()\[\]{}]+", query)
         return [t for t in tokens if len(t) >= 2][:5]

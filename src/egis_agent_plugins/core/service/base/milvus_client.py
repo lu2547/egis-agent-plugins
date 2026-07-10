@@ -214,6 +214,7 @@ class MilvusClient:
         collection_name: str | None = None,
         filter_expr: str | None = None,
         anns_field: str | None = None,
+        sparse_anns_field: str | None = None,
         output_fields: list[str] | None = None,
         vector_weight: float = 0.7,
         keywords_weight: float = 0.3,
@@ -228,6 +229,9 @@ class MilvusClient:
             tag_ids: 可选，tag ID 过滤列表（多 tag OR 语义）。
             filter_expr: 可选，外部传入的过滤表达式，优先级高于内部构建。
             anns_field: 可选，向量字段名（默认 'embedding'）。
+            sparse_anns_field: 可选，BM25 稀疏向量字段名（默认
+                'content_sparse'）。和 ``anns_field`` 一起传入时可用于
+                在同一 collection 中检索另一套文本表征（例如 metadata）。
             output_fields: 可选，输出字段列表（默认 OUTPUT_FIELDS）。
             vector_weight: 混合检索中的向量权重，默认 0.7。
             keywords_weight: 混合检索中的 BM25 权重，默认 0.3。
@@ -296,6 +300,8 @@ class MilvusClient:
                 hybrid_ranker=hybrid_ranker,
                 rrf_k=rrf_k,
                 output_fields=output_fields,
+                dense_anns_field=anns_field,
+                sparse_anns_field=sparse_anns_field,
             )
 
         else:
@@ -491,6 +497,8 @@ class MilvusClient:
         hybrid_ranker: str = "weighted",
         rrf_k: int = 60,
         output_fields: list[str] | None = None,
+        dense_anns_field: str | None = None,
+        sparse_anns_field: str | None = None,
     ) -> list[MilvusSearchResult]:
         """在指定 collection 上执行混合检索（Milvus 原生 hybrid_search）。
 
@@ -506,7 +514,7 @@ class MilvusClient:
         try:
             vector_req = AnnSearchRequest(
                 data=[query_embedding],
-                anns_field=self.FIELD_EMBEDDING,
+                anns_field=dense_anns_field or self.FIELD_EMBEDDING,
                 param={
                     "metric_type": self._config.milvus_metric_type,
                     "params": {"nprobe": 10},
@@ -517,7 +525,7 @@ class MilvusClient:
 
             keywords_req = AnnSearchRequest(
                 data=[query_text],
-                anns_field=self.FIELD_CONTENT_SPARSE,
+                anns_field=sparse_anns_field or self.FIELD_CONTENT_SPARSE,
                 param={"params": {"drop_ratio_search": 0.2}},
                 limit=top_k * 2,
                 expr=filter_expr,

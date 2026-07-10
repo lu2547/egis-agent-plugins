@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+import json
 
 import pytest
 
@@ -66,6 +67,110 @@ class TestChitchatGuard:
         from egis_agent_plugins.core.flows.rag.guards import _is_obvious_no_retrieval
         ictx = _make_ictx(args={"query": "complex query"}, probing=True)
         _is_obvious_no_retrieval(ictx)
+
+
+class TestDocumentQueryPlan:
+    def test_rewrite_preserves_range_and_all_year_queries(self) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.rewrite.service import QueryRewriteService
+
+        # _parse_response only needs the configured sub-query limit; no model call.
+        service = object.__new__(QueryRewriteService)
+        service._max_sub_queries = 4
+        result = service._parse_response(json.dumps({
+            "rewrite_query": "企业年金近五年数据报告",
+            "doc_query": "企业年金数据报告",
+            "analysis_query": "企业年金近五年数据趋势",
+            "sub_queries": ["企业年金数据报告"],
+            "intent": "rag",
+            "doc_queries": [
+                "企业年金最近五个完整自然年数据报告",
+                "企业年金2025年数据报告",
+                "企业年金2024年数据报告",
+                "企业年金2023年数据报告",
+                "企业年金2022年数据报告",
+                "企业年金2021年数据报告",
+            ],
+        }), "企业年金最近五年数据报告")
+
+        assert len(result.doc_queries) == 6
+        assert result.doc_queries[0] == "企业年金最近五个完整自然年数据报告"
+        assert result.doc_queries[-1] == "企业年金2021年数据报告"
+
+    def test_object_doc_queries_are_not_supported(self) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.rewrite.service import QueryRewriteService
+
+        service = object.__new__(QueryRewriteService)
+        service._max_sub_queries = 4
+        result = service._parse_response(json.dumps({
+            "rewrite_query": "测试报告",
+            "doc_query": "测试报告",
+            "analysis_query": "分析测试报告",
+            "intent": "rag",
+            "doc_queries": [{"query": "旧对象格式"}],
+        }), "测试报告")
+
+        assert result.doc_queries == ["测试报告"]
+
+
+class TestDocumentSelectRRF:
+    def test_summary_and_metadata_results_are_fused_by_knowledge_id(self) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _rrf_merge_documents
+
+        result = _rrf_merge_documents(
+            [
+                ("summary", [
+                    {"knowledge_id": "both", "score": 0.9},
+                    {"knowledge_id": "summary-only", "score": 0.8},
+                ]),
+                ("metadata", [
+                    {"knowledge_id": "metadata-only", "score": 0.9},
+                    {"knowledge_id": "both", "score": 0.8},
+                ]),
+            ],
+            rrf_k=60,
+            query="指定条件的报告",
+        )
+
+        assert result[0]["knowledge_id"] == "both"
+        assert set(result[0]["initial_recall_components"]["routes"]) == {"summary", "metadata"}
+
+    def test_independent_query_scores_are_not_added(self) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _union_query_candidates
+
+        selected, coverage = _union_query_candidates([
+            ("产品A报告", [
+                {"knowledge_id": "shared", "score": 0.6},
+                {"knowledge_id": "a-only", "score": 0.9},
+            ]),
+            ("产品B报告", [
+                {"knowledge_id": "shared", "score": 0.7},
+                {"knowledge_id": "b-only", "score": 0.8},
+            ]),
+        ])
+
+        by_id = {item["knowledge_id"]: item for item in selected}
+        assert by_id["shared"]["score"] == 0.7
+        assert coverage["产品A报告"] == ["shared", "a-only"]
+        assert coverage["产品B报告"] == ["shared", "b-only"]
+
+
+class TestEvidenceBudget:
+    def test_budget_is_shared_across_documents_and_prefers_anchors(self) -> None:
+        from egis_agent_plugins.core.flows.rag.workflow import _select_evidence_by_document
+
+        evidence = [
+            {"knowledge_id": "doc-a", "chunk_id": "a-0", "chunk_index": 0, "score": 0.1},
+            {"knowledge_id": "doc-a", "chunk_id": "a-1", "chunk_index": 1, "score": 0.9, "is_anchor": True},
+            {"knowledge_id": "doc-a", "chunk_id": "a-2", "chunk_index": 2, "score": 0.2},
+            {"knowledge_id": "doc-b", "chunk_id": "b-0", "chunk_index": 0, "score": 0.1},
+            {"knowledge_id": "doc-b", "chunk_id": "b-1", "chunk_index": 1, "score": 0.8, "is_anchor": True},
+            {"knowledge_id": "doc-b", "chunk_id": "b-2", "chunk_index": 2, "score": 0.2},
+        ]
+
+        selected = _select_evidence_by_document(evidence, max_items=4)
+
+        assert [item["chunk_id"] for item in selected[:2]] == ["a-1", "b-1"]
+        assert {item["knowledge_id"] for item in selected} == {"doc-a", "doc-b"}
 
 
 class TestRouteGuards:

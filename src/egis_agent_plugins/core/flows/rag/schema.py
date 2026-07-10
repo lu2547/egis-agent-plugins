@@ -88,6 +88,9 @@ class RewriteResult:
     keywords: list[str] = field(default_factory=list)
     sub_queries: list[str] = field(default_factory=list)
     rewrite_query: str = ""
+    doc_query: str = ""
+    analysis_query: str = ""
+    doc_queries: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +98,9 @@ class RewriteResult:
             "keywords": self.keywords,
             "sub_queries": self.sub_queries,
             "rewrite_query": self.rewrite_query,
+            "doc_query": self.doc_query,
+            "analysis_query": self.analysis_query,
+            "doc_queries": self.doc_queries,
         }
 
 

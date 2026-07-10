@@ -283,6 +283,7 @@ class RagRetrievalWorkflow(Workflow):
                 "rewrite_query": query,
                 "doc_query": "",
                 "analysis_query": "",
+                "doc_queries": [],
             }
             ictx.instance_data["timings"]["rewrite_ms"] = int((time.perf_counter() - t0) * 1000)
             return None
@@ -304,6 +305,7 @@ class RagRetrievalWorkflow(Workflow):
         rewrite_query = result.get("rewrite_query", "")
         doc_query = result.get("doc_query", "")
         analysis_query = result.get("analysis_query", "")
+        doc_queries = result.get("doc_queries", [])
 
         # 如果 LLM 没传 source 但 intent=web_search，设置 source=web
         if ictx.instance_data.get("source") == "auto" and intent == "web_search":
@@ -316,6 +318,7 @@ class RagRetrievalWorkflow(Workflow):
             "rewrite_query": rewrite_query,
             "doc_query": doc_query,
             "analysis_query": analysis_query,
+            "doc_queries": doc_queries,
         }
 
         emit_progress(
@@ -326,6 +329,7 @@ class RagRetrievalWorkflow(Workflow):
                 "rewrite": rewrite_query,
                 "doc_query": doc_query,
                 "analysis_query": analysis_query,
+                "doc_queries": doc_queries,
                 "intent": intent,
                 "route": intent,
                 "keywords": keywords,
@@ -415,6 +419,7 @@ class RagRetrievalWorkflow(Workflow):
 
         sd_args: dict[str, Any] = {
             "query": doc_query,
+            "doc_queries": rewrite.get("doc_queries") or [],
             "summary_query": analysis_query,
             "top_k": int(os.getenv("RAG_DOCUMENT_SELECT_TOP_K", "20")),
             "recall_top_k": int(os.getenv("RAG_DOCUMENT_SELECT_RECALL_TOP_K", "60")),
@@ -429,6 +434,7 @@ class RagRetrievalWorkflow(Workflow):
             status="pending",
             extra={
                 "query": doc_query,
+                "doc_queries": rewrite.get("doc_queries") or [],
                 "summary_query": analysis_query,
                 "document_match_strategy": {
                     "hints": ictx.instance_data.get("hints") or {},
@@ -458,7 +464,19 @@ class RagRetrievalWorkflow(Workflow):
         ictx.instance_data["document_select_thresholds"] = result.get("document_select_thresholds") or {}
         ictx.instance_data["rejected_documents"] = result.get("rejected_documents") or []
         ictx.instance_data["excluded_documents"] = result.get("excluded_documents") or []
-        ictx.instance_data["document_read_mode"] = _document_read_mode()
+        read_mode = _document_read_mode()
+        selected_documents = result.get("documents", [])
+        matched_queries = {
+            str(match.get("query") or "")
+            for document in selected_documents
+            for match in document.get("query_matches", [])
+            if str(match.get("query") or "")
+        }
+        if len(selected_documents) > 1 and len(matched_queries) > 1:
+            # 只有实际选中文档来自多个独立 query 时才逐文档读取；若多条 query
+            # 最终都指向同一材料，仍沿用默认读取模式。
+            read_mode = "per_document_read"
+        ictx.instance_data["document_read_mode"] = read_mode
         ictx.instance_data["candidates"] = []
         emit_progress(
             ctx,
@@ -514,7 +532,11 @@ class RagRetrievalWorkflow(Workflow):
 
     def _rag_queries(self, ictx: InstanceCtx) -> list[str]:
         rewrite = ictx.instance_data.get("rewrite") or {}
-        query = rewrite.get("rewrite_query") or ictx.instance_data.get("query", "")
+        query = (
+            rewrite.get("analysis_query")
+            or rewrite.get("rewrite_query")
+            or ictx.instance_data.get("query", "")
+        )
         sub_queries = rewrite.get("sub_queries", [])
 
         original_query = ictx.instance_data.get("query", "")
@@ -562,7 +584,7 @@ class RagRetrievalWorkflow(Workflow):
 
         small_limit = int(os.getenv("RAG_SMALL_DOC_CHUNK_LIMIT", "50"))
         read_plan: list[dict[str, Any]] = []
-        large_documents: list[dict[str, Any]] = []
+        recall_documents: list[dict[str, Any]] = []
         marker_candidates: list[dict[str, Any]] = []
         for doc in selected_documents:
             kid = str(doc.get("knowledge_id", "")).strip()
@@ -594,8 +616,7 @@ class RagRetrievalWorkflow(Workflow):
                     "source_query": queries[0],
                     "query_type": "document_marker",
                 })
-            else:
-                large_documents.append(doc)
+            recall_documents.append(doc)
 
         emit_progress(
             ctx,
@@ -605,7 +626,7 @@ class RagRetrievalWorkflow(Workflow):
                 "document_read_mode": "per_document_read",
                 "selected_docs": len(selected_documents),
                 "small_docs": len(marker_candidates),
-                "large_docs": len(large_documents),
+                "recall_docs": len(recall_documents),
             },
         )
 
@@ -680,7 +701,7 @@ class RagRetrievalWorkflow(Workflow):
                 return ranked
 
         ranked_groups = await asyncio.gather(
-            *(_recall_rank_one(doc) for doc in large_documents),
+            *(_recall_rank_one(doc) for doc in recall_documents),
             return_exceptions=True,
         )
         ranked_anchors: list[dict[str, Any]] = []
@@ -717,7 +738,11 @@ class RagRetrievalWorkflow(Workflow):
         emit_progress(ctx, tool="knowledge_search", status="pending")
 
         rewrite = ictx.instance_data.get("rewrite") or {}
-        query = rewrite.get("rewrite_query") or ictx.instance_data.get("query", "")
+        query = (
+            rewrite.get("analysis_query")
+            or rewrite.get("rewrite_query")
+            or ictx.instance_data.get("query", "")
+        )
         sub_queries = rewrite.get("sub_queries", [])
         keywords = rewrite.get("keywords", [])
 
@@ -729,7 +754,11 @@ class RagRetrievalWorkflow(Workflow):
         for sq in sub_queries:
             if sq and sq not in queries:
                 queries.append(sq)
-        queries = queries[:5]
+        try:
+            max_queries = max(1, int(os.getenv("RAG_CHUNK_RECALL_MAX_QUERIES", "12")))
+        except ValueError:
+            max_queries = 12
+        queries = queries[:max_queries]
 
         if not queries:
             ictx.instance_data["candidates"] = []
@@ -884,6 +913,13 @@ class RagRetrievalWorkflow(Workflow):
             read_stats = {
                 "document_read_mode": ictx.instance_data.get("document_read_mode") or "global_chunk_rerank",
             }
+        evidence_before_budget = len(evidence)
+        evidence = _select_evidence_by_document(
+            evidence,
+            max_items=max(1, int(os.getenv("RAG_EVIDENCE_MAX_CHUNKS", "12"))),
+        )
+        read_stats["evidence_before_budget"] = evidence_before_budget
+        read_stats["evidence_after_budget"] = len(evidence)
         ictx.instance_data["evidence"] = evidence
         ictx.instance_data["evidence_sufficient"] = bool(evidence)
         emit_progress(
@@ -949,6 +985,8 @@ class RagRetrievalWorkflow(Workflow):
             ictx.instance_data.get("query", ""),
             ictx.instance_data.get("evidence", []),
             refs,
+            query_plan=ictx.instance_data.get("rewrite") or {},
+            selected_documents=ictx.instance_data.get("selected_documents") or [],
         )
 
         logger.info(
@@ -976,6 +1014,7 @@ class RagRetrievalWorkflow(Workflow):
                         "original": ictx.instance_data.get("query", ""),
                         "rewrite": (ictx.instance_data.get("rewrite") or {}).get("rewrite_query", ""),
                         "doc_query": (ictx.instance_data.get("rewrite") or {}).get("doc_query", ""),
+                        "doc_queries": (ictx.instance_data.get("rewrite") or {}).get("doc_queries", []),
                         "analysis_query": (ictx.instance_data.get("rewrite") or {}).get("analysis_query", ""),
                         "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
                         "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
@@ -1016,6 +1055,8 @@ class RagRetrievalWorkflow(Workflow):
             ictx.instance_data.get("query", ""),
             ranked[:5],  # Use ranked as evidence
             refs,
+            query_plan=ictx.instance_data.get("rewrite") or {},
+            selected_documents=ictx.instance_data.get("selected_documents") or [],
         )
 
         partial_evidence = ranked[:5]
@@ -1038,6 +1079,7 @@ class RagRetrievalWorkflow(Workflow):
                         "original": ictx.instance_data.get("query", ""),
                         "rewrite": (ictx.instance_data.get("rewrite") or {}).get("rewrite_query", ""),
                         "doc_query": (ictx.instance_data.get("rewrite") or {}).get("doc_query", ""),
+                        "doc_queries": (ictx.instance_data.get("rewrite") or {}).get("doc_queries", []),
                         "analysis_query": (ictx.instance_data.get("rewrite") or {}).get("analysis_query", ""),
                         "sub_queries": (ictx.instance_data.get("rewrite") or {}).get("sub_queries", []),
                         "intent": (ictx.instance_data.get("rewrite") or {}).get("intent", ""),
@@ -1099,6 +1141,52 @@ class RagRetrievalWorkflow(Workflow):
 # ── Evidence text builder ────────────────────────────────────────────────
 
 
+def _select_evidence_by_document(
+    evidence: list[dict[str, Any]],
+    *,
+    max_items: int,
+) -> list[dict[str, Any]]:
+    """Allocate the answer evidence budget fairly across source documents."""
+    if max_items <= 0 or len(evidence) <= max_items:
+        return evidence
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in evidence:
+        group_key = (
+            str(item.get("knowledge_id") or "").strip()
+            or str(item.get("knowledge_title") or "").strip()
+            or f"{item.get('source', 'unknown')}:{item.get('chunk_id', '')}"
+        )
+        groups.setdefault(group_key, []).append(item)
+
+    def _priority(item: dict[str, Any]) -> tuple[int, float, int]:
+        score = max(
+            float(item.get("score", 0.0) or 0.0),
+            float(item.get("anchor_score", 0.0) or 0.0),
+        )
+        return (
+            0 if item.get("is_anchor") else 1,
+            -score,
+            int(item.get("chunk_index", 0) or 0),
+        )
+
+    queues = [sorted(items, key=_priority) for items in groups.values()]
+    selected: list[dict[str, Any]] = []
+    offset = 0
+    while len(selected) < max_items:
+        added = False
+        for queue in queues:
+            if offset < len(queue):
+                selected.append(queue[offset])
+                added = True
+                if len(selected) >= max_items:
+                    break
+        if not added:
+            break
+        offset += 1
+    return selected
+
+
 def _evidence_excerpt(content: str, max_chars: int) -> str:
     """Return a budgeted evidence excerpt while keeping sentence boundaries."""
     content = (content or "").strip()
@@ -1117,6 +1205,9 @@ def _build_evidence_text(
     query: str,
     evidence: list[dict[str, Any]],
     references: list[dict[str, Any]],
+    *,
+    query_plan: dict[str, Any] | None = None,
+    selected_documents: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build LLM-facing evidence pack text.
 
@@ -1125,12 +1216,32 @@ def _build_evidence_text(
     """
     lines = [
         "=== RAG 检索结果 ===",
+        f"当前日期: {time.strftime('%Y-%m-%d')}",
         f"查询: {query}",
         f"找到 {len(evidence)} 条证据，{len(references)} 条引用",
         "回答约束: 只能使用下方证据原文中的事实、数字和结论；证据中没有的信息必须说明未检索到，不得用常识或记忆补全。",
+        "推断约束: 不得使用“预计、推测、可能仍会、初步判断”等措辞补足缺失数据；趋势和优劣结论必须由跨期事实直接支撑。",
+        "缺失表述约束: 本次证据未覆盖某项信息，不等于知识库不存在该信息。除非证据明确证明，否则只能说“本次检索证据未覆盖”，不得断言“知识库中没有/缺少某文档”。",
         "引用方式: 在对应文字末尾用 [N] 标注证据编号（如 [1]、[2]），同一来源复用同一编号。禁止使用 <kb> 等其它引用格式。",
         "",
     ]
+
+    plan_queries = [
+        item.strip()
+        for item in (query_plan or {}).get("doc_queries", [])
+        if isinstance(item, str) and item.strip()
+    ]
+    if plan_queries:
+        lines.append("文档检索计划: " + "；".join(plan_queries))
+    selected_titles = [
+        str(document.get("knowledge_title") or document.get("file_name") or "").strip()
+        for document in selected_documents or []
+        if str(document.get("knowledge_title") or document.get("file_name") or "").strip()
+    ]
+    if selected_titles:
+        lines.append("本次选中文档: " + "；".join(dict.fromkeys(selected_titles)))
+    if plan_queries or selected_titles:
+        lines.append("")
 
     # 构建 kid → title 映射
     kid_title_map: dict[str, str] = {}

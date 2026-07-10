@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+from datetime import date
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -32,7 +33,12 @@ _filename_score_llm: Any | None = None
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-SUMMARY_ANNS_FIELD = "embedding"
+# summary_knowledge_base 同时存储摘要与 metadata 的两套 dense/sparse 表征。
+# 文档选择会分别检索两路，再在应用侧以 knowledge_id 做 RRF。
+SUMMARY_DENSE_FIELD = "embedding"
+SUMMARY_SPARSE_FIELD = "content_sparse"
+METADATA_DENSE_FIELD = "metadata_embedding"
+METADATA_SPARSE_FIELD = "metadata_sparse"
 SUMMARY_OUTPUT_FIELDS = ["knowledge_id", "knowledge_base_id", "content", "file_name"]
 
 
@@ -197,6 +203,111 @@ def _dedup_documents(documents: list[dict]) -> list[dict]:
     return out
 
 
+def _normalize_document_queries(query: str, value: Any) -> list[str]:
+    """Normalize the rewrite stage's document-query plan without truncating it."""
+    raw = value if isinstance(value, list) else []
+    queries: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        queries.append(text)
+    return queries or [query]
+
+
+def _rrf_merge_documents(
+    ranked_lists: list[tuple[str, list[dict]]],
+    *,
+    rrf_k: int,
+    query: str = "",
+    scope: RecallScope | None = None,
+) -> list[dict]:
+    """Fuse summary and metadata rankings for one independent query."""
+    merged: dict[str, dict[str, Any]] = {}
+    for source, ranked in ranked_lists:
+        for rank, original in enumerate(ranked):
+            knowledge_id = str(original.get("knowledge_id") or "")
+            if not knowledge_id:
+                continue
+            item = merged.get(knowledge_id)
+            if item is None:
+                item = dict(original)
+                item["score"] = 0.0
+                item["initial_recall_components"] = {
+                    "hybrid_ranker": "rrf",
+                    "rrf_k": rrf_k,
+                    "retrieval_query": query,
+                    "routes": {},
+                }
+                merged[knowledge_id] = item
+            contribution = 1.0 / (rrf_k + rank + 1)
+            item["score"] = float(item["score"]) + contribution
+            components = item["initial_recall_components"]
+            routes = components["routes"]
+            routes.setdefault(source, []).append({"rank": rank + 1, "rrf_score": contribution})
+            if scope:
+                item["scope"] = {
+                    "kb_id": scope.kb_id,
+                    "kb_name": scope.kb_name,
+                    "source": scope.source,
+                }
+
+    documents = sorted(merged.values(), key=lambda item: float(item["score"]), reverse=True)
+    for document in documents:
+        components = document["initial_recall_components"]
+        components["score"] = float(document["score"])
+    return documents
+
+
+def _union_query_candidates(
+    query_candidates: list[tuple[str, list[dict]]],
+) -> tuple[list[dict], dict[str, list[str]]]:
+    """Union independently selected query candidates by knowledge_id.
+
+    A document occurring in several query lists keeps its best query-document
+    score. Scores from different queries are never added together.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    coverage: dict[str, list[str]] = {}
+    for query_text, documents in query_candidates:
+        coverage[query_text] = []
+        for rank, original in enumerate(documents, 1):
+            knowledge_id = str(original.get("knowledge_id") or "")
+            if not knowledge_id:
+                continue
+            coverage[query_text].append(knowledge_id)
+            match = {
+                "query": query_text,
+                "rank": rank,
+                "score": float(original.get("score", 0.0) or 0.0),
+                "document_match_scores": original.get("document_match_scores", {}),
+                "initial_recall_components": original.get("initial_recall_components", {}),
+            }
+            existing = merged.get(knowledge_id)
+            if existing is None:
+                existing = dict(original)
+                existing["query_matches"] = [match]
+                merged[knowledge_id] = existing
+            else:
+                existing.setdefault("query_matches", []).append(match)
+                if match["score"] > float(existing.get("score", 0.0) or 0.0):
+                    preserved_matches = existing["query_matches"]
+                    existing = dict(original)
+                    existing["query_matches"] = preserved_matches
+                    merged[knowledge_id] = existing
+
+    selected = sorted(
+        merged.values(),
+        key=lambda document: float(document.get("score", 0.0) or 0.0),
+        reverse=True,
+    )
+    return selected, coverage
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -332,13 +443,17 @@ async def _llm_filename_scores(
     system = (
         "你是文档文件名语义相似度评分器。"
         "只判断 query 与 passage 是否指向同一类/同一份/同一主题文档。"
-        "忽略文件后缀、年份/年度只作为区分信息；不要判断 passage 能否回答业务问题。"
+        "忽略文件后缀，但必须严格检查 query 中的限定条件是否与 passage 一致；"
+        "时间、实体、产品、地区、版本、文档类型等明确限定不一致时应给低分，不能只按主题相似给高分。"
+        "query 含相对时间时使用输入中的 current_date 判断。"
+        "不要判断 passage 能否回答业务问题。"
         "输出 0 到 1 的分数，1 表示高度匹配，0 表示完全不相关。"
         "必须只输出 JSON，不要解释。格式："
         '{"scores":[{"index":0,"score":0.0}]}'
     )
     user = json.dumps(
         {
+            "current_date": date.today().isoformat(),
             "query": query,
             "items": items,
         },
@@ -489,6 +604,7 @@ def _shortlist_documents(
         doc for doc in documents
         if float(doc.get("score", 0.0) or 0.0) >= cutoff
     ]
+
     if diversity_strategy == "mmr" and len(eligible) > max_documents:
         selected = apply_mmr(
             eligible,
@@ -512,7 +628,7 @@ def _shortlist_documents(
         "eligible_documents": len(eligible),
         "diversity_strategy": diversity_strategy,
         "mmr_lambda": mmr_lambda if diversity_strategy == "mmr" else None,
-        "recall_source": "summary_milvus_rrf",
+        "recall_source": "summary_metadata_multi_query_rrf",
         "score_source": "llm_filename_plus_summary_rerank",
     }
     return selected, rejected, thresholds
@@ -603,6 +719,7 @@ async def run(
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query 参数不能为空"}
+    document_queries = _normalize_document_queries(query, args.get("doc_queries"))
     summary_query = (args.get("summary_query") or args.get("analysis_query") or query).strip()
     hints = args.get("hints") if isinstance(args.get("hints"), dict) else {}
     document_match_strategy = _document_match_strategy(hints)
@@ -640,13 +757,20 @@ async def run(
 
     summary_collection = clients.summary_collection
     logger.info(
-        "[SelectDocuments] query=%s, collection=%s, kb_ids=%s, tag_ids=%s, knowledge_ids=%s",
-        query[:60], summary_collection, resolved.kb_ids, resolved.tag_ids, resolved.knowledge_ids,
+        "[SelectDocuments] query=%s, document_queries=%s, collection=%s, kb_ids=%s, tag_ids=%s, knowledge_ids=%s",
+        query[:60], document_queries, summary_collection, resolved.kb_ids, resolved.tag_ids, resolved.knowledge_ids,
     )
 
     try:
         _t_embed = time.perf_counter()
-        query_embedding = await clients.embedding.embed_query(query)
+        embeddings = await asyncio.gather(*(
+            clients.embedding.embed_query(query_text)
+            for query_text in document_queries
+        ))
+        query_embeddings = {
+            query_text: embedding
+            for query_text, embedding in zip(document_queries, embeddings)
+        }
         logger.info("[SelectDocuments] stage=embed cost_ms=%d", int((time.perf_counter() - _t_embed) * 1000))
 
         scopes = scope_plan.scopes if scope_plan.has_scopes else [RecallScope()]
@@ -660,65 +784,153 @@ async def run(
 
         sem = asyncio.Semaphore(int(os.getenv("RAG_SCOPE_SELECT_CONCURRENCY", "3")))
 
-        async def _search_scope(scope: RecallScope) -> list[dict]:
+        async def _search_scope_query(
+            scope: RecallScope,
+            query_text: str,
+        ) -> tuple[str, list[dict]]:
             filter_expr = scope.to_filter_expr(include_enabled=True)
             async with sem:
-                search_results = await asyncio.to_thread(
-                    clients.milvus.search,
-                    query_embedding=query_embedding,
-                    query_text=query,
-                    retriever_type=RetrieverType.HYBRID,
-                    collection_name=summary_collection,
-                    filter_expr=filter_expr,
-                    top_k=top_k,
-                    output_fields=SUMMARY_OUTPUT_FIELDS,
-                    hybrid_ranker="rrf",
-                    rrf_k=rrf_k,
+                summary_result, metadata_result = await asyncio.gather(
+                    asyncio.to_thread(
+                        clients.milvus.search,
+                        query_embedding=query_embeddings[query_text],
+                        query_text=query_text,
+                        retriever_type=RetrieverType.HYBRID,
+                        collection_name=summary_collection,
+                        filter_expr=filter_expr,
+                        top_k=top_k,
+                        output_fields=SUMMARY_OUTPUT_FIELDS,
+                        hybrid_ranker="rrf",
+                        rrf_k=rrf_k,
+                        anns_field=SUMMARY_DENSE_FIELD,
+                        sparse_anns_field=SUMMARY_SPARSE_FIELD,
+                    ),
+                    asyncio.to_thread(
+                        clients.milvus.search,
+                        query_embedding=query_embeddings[query_text],
+                        query_text=query_text,
+                        retriever_type=RetrieverType.HYBRID,
+                        collection_name=summary_collection,
+                        filter_expr=filter_expr,
+                        top_k=top_k,
+                        output_fields=SUMMARY_OUTPUT_FIELDS,
+                        hybrid_ranker="rrf",
+                        rrf_k=rrf_k,
+                        anns_field=METADATA_DENSE_FIELD,
+                        sparse_anns_field=METADATA_SPARSE_FIELD,
+                    ),
                 )
-            docs = _documents_from_search_results(search_results)
-            for doc in docs:
-                doc["initial_recall_components"] = {
-                    "hybrid_ranker": "rrf",
-                    "rrf_k": rrf_k,
-                    "score": float(doc.get("score", 0.0) or 0.0),
-                }
-                doc["scope"] = {
-                    "kb_id": scope.kb_id,
-                    "kb_name": scope.kb_name,
-                    "source": scope.source,
-                }
+            docs = _rrf_merge_documents(
+                [
+                    ("summary", _documents_from_search_results(summary_result)),
+                    ("metadata", _documents_from_search_results(metadata_result)),
+                ],
+                rrf_k=rrf_k,
+                query=query_text,
+                scope=scope,
+            )
             logger.info(
-                "[SelectDocuments] scope=%s mode=hybrid_rrf docs=%d filter=%s rrf_k=%d",
+                "[SelectDocuments] scope=%s query=%s mode=summary_metadata_rrf docs=%d filter=%s rrf_k=%d",
                 scope.kb_id or "*",
+                query_text[:80],
                 len(docs),
                 filter_expr,
                 rrf_k,
             )
-            return docs
+            return query_text, docs
 
         scope_results = await asyncio.gather(
-            *(_search_scope(scope) for scope in scopes),
+            *(
+                _search_scope_query(scope, query_text)
+                for scope in scopes
+                for query_text in document_queries
+            ),
             return_exceptions=True,
         )
         logger.info("[SelectDocuments] stage=milvus cost_ms=%d", int((time.perf_counter() - _t_milvus) * 1000))
 
-        documents: list[dict] = []
+        query_results: dict[str, list[dict]] = {}
         for result in scope_results:
             if isinstance(result, Exception):
                 logger.warning("[SelectDocuments] scoped search failed: %s", result)
                 continue
-            documents.extend(result)
-        documents = _dedup_documents(documents)
-        await _fill_document_titles(clients, documents)
-        documents, excluded_by_hint = _apply_excluded_files(documents, hints)
-        documents = await _apply_document_strategy(
-            clients=clients,
-            query=query,
-            summary_query=summary_query,
-            documents=documents,
-            hints=hints,
+            query_text, result_documents = result
+            if not result_documents:
+                continue
+            current = query_results.setdefault(query_text, [])
+            current.extend(result_documents)
+
+        # 各 query 的候选独立精排、独立过阈值。不同 query 之间只取并集，
+        # 不累加 RRF 分数，避免“每条 query 都泛化命中”的文档获得虚假优势。
+        for result_documents in query_results.values():
+            result_documents[:] = _dedup_documents(result_documents)
+        all_documents = [
+            document
+            for result_documents in query_results.values()
+            for document in result_documents
+        ]
+        await _fill_document_titles(clients, all_documents)
+
+        excluded_by_id: dict[str, dict] = {}
+        per_query_rerank_top_k = max(
+            1,
+            _env_int("RAG_DOCUMENT_SELECT_PER_QUERY_RERANK_TOP_K", 20),
         )
-        selected_documents, rejected_documents, select_thresholds = _shortlist_documents(documents)
+
+        async def _score_query_documents(
+            query_text: str,
+            result_documents: list[dict],
+        ) -> tuple[str, list[dict], list[dict], dict[str, Any]]:
+            included, excluded = _apply_excluded_files(result_documents, hints)
+            for document in excluded:
+                knowledge_id = str(document.get("knowledge_id") or "")
+                if knowledge_id:
+                    excluded_by_id[knowledge_id] = document
+            included = included[:per_query_rerank_top_k]
+            scored = await _apply_document_strategy(
+                clients=clients,
+                query=query_text,
+                summary_query=query_text,
+                documents=included,
+                hints=hints,
+            )
+            selected, rejected, thresholds = _shortlist_documents(scored)
+            return query_text, selected, rejected, thresholds
+
+        scored_query_results = await asyncio.gather(*(
+            _score_query_documents(query_text, result_documents)
+            for query_text, result_documents in query_results.items()
+        ))
+        query_candidates = [
+            (query_text, selected)
+            for query_text, selected, _rejected, _thresholds in scored_query_results
+        ]
+        selected_documents, query_coverage = _union_query_candidates(query_candidates)
+        selected_ids = {
+            str(document.get("knowledge_id") or "")
+            for document in selected_documents
+        }
+        rejected_by_id: dict[str, dict] = {}
+        per_query_thresholds: dict[str, dict[str, Any]] = {}
+        for query_text, _selected, rejected, thresholds in scored_query_results:
+            per_query_thresholds[query_text] = thresholds
+            for document in rejected:
+                knowledge_id = str(document.get("knowledge_id") or "")
+                if knowledge_id and knowledge_id not in selected_ids:
+                    rejected_by_id[knowledge_id] = document
+        rejected_documents = sorted(
+            rejected_by_id.values(),
+            key=lambda document: float(document.get("score", 0.0) or 0.0),
+            reverse=True,
+        )
+        excluded_by_hint = list(excluded_by_id.values())
+        select_thresholds = {
+            "max_documents": max(final_top_k, len(selected_documents)),
+            "query_coverage": query_coverage,
+            "per_query": per_query_thresholds,
+            "recall_source": "summary_metadata_rrf_per_query_union",
+        }
+        documents = all_documents
         logger.info(
             "[SelectDocuments] strategy=%s thresholds=%s candidates=%d selected=%d rejected=%d excluded=%d selected=%s rejected=%s excluded_docs=%s",
             document_match_strategy,
@@ -743,7 +955,7 @@ async def run(
                 "excluded_documents": excluded_by_hint,
                 "knowledge_base_ids": resolved.kb_ids,
                 "tag_ids": resolved.tag_ids,
-                "summary": f"未在摘要库中找到匹配文档（查询: {query}）",
+                "summary": f"未在文档摘要或元数据中找到匹配文档（查询: {query}）",
                 "display_type": "document_shortlist",
             }
 
