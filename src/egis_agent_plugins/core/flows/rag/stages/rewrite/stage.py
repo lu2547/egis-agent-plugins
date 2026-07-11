@@ -1,83 +1,21 @@
-"""Query Rewrite Stage —— LLM 意图识别 + 查询改写。
-
-模块级 ``run()`` 是 workflow / 单测的唯一入口。
-"""
+"""Deterministic query-tokenization stage."""
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-from .service import QueryRewriteService, RewriteResult
+from .service import QueryRewriteService
 
-logger = logging.getLogger(__name__)
-
-
-# ── 模块级缓存：LLM service 单例（避免每次 run 都 create_chat_model_from_env）──
-_service_singleton: QueryRewriteService | None = None
-
-
-def _get_service() -> QueryRewriteService:
-    global _service_singleton
-    if _service_singleton is None:
-        from ark_agentic.core.llm import create_chat_model_from_env
-
-        llm = create_chat_model_from_env()
-        _service_singleton = QueryRewriteService(llm=llm)
-    return _service_singleton
+_service = QueryRewriteService()
 
 
 async def run(
     *,
     args: dict[str, Any],
-    ctx: dict[str, Any] | None = None,
-    clients: Any | None = None,  # noqa: ARG001 — rewrite 阶段不消费 clients
+    ctx: dict[str, Any] | None = None,  # noqa: ARG001
+    clients: Any | None = None,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """Query rewrite 业务核心。
-
-    Returns dict: ``{"intent", "keywords", "sub_queries", "rewrite_query", "doc_query", "analysis_query"}``
-    """
-    query = (args.get("query") or "").strip()
+    query = str(args.get("query") or "").strip()
     if not query:
         return {"error": "query 不能为空"}
-
-    history = args.get("history")
-    language = args.get("language") or "zh-CN"
-    pinned = args.get("pinned_knowledge_ids")
-    current_user_input = str(args.get("current_user_input") or "").strip()
-    previous_rag_context = (
-        args.get("previous_rag_context")
-        if isinstance(args.get("previous_rag_context"), dict)
-        else {}
-    )
-
-    try:
-        service = _get_service()
-    except Exception as e:
-        logger.warning("[QueryRewrite] LLM 初始化失败，使用原始 query: %s", e)
-        return RewriteResult(
-            rewrite_query=query,
-            sub_queries=[query],
-            intent="rag",
-            keywords=[],
-        ).to_dict()
-
-    try:
-        result = await service.rewrite(
-            query,
-            history=history,
-            language=language,
-            pinned_knowledge_ids=pinned,
-            current_user_input=current_user_input,
-            previous_rag_context=previous_rag_context,
-        )
-    except Exception as e:
-        logger.warning("[QueryRewrite] rewrite 失败，使用原始 query: %s", e)
-        result = RewriteResult(
-            rewrite_query=query,
-            sub_queries=[query],
-            intent="rag",
-            keywords=[],
-        )
-
-    return result.to_dict()
+    return (await _service.rewrite(query)).to_dict()

@@ -5,23 +5,15 @@ candidate 统一 schema、以及 reference / evidence 类型。
 
 ──── 分数字段命名约定（全局权威定义）────
 
-一条 document / candidate / evidence 上可能同时存在以下分数，语义必须一致：
+* ``document_score``：summary/metadata 两路 hybrid 排名经文档级 RRF 后的文档选择分。
+* ``summary_score``：summary 路的归一化文档召回分，进入综合评分的 10% 项。
+* ``raw_recall_score`` / ``recall_score``：chunk hybrid recall 原始分/批内归一化分。
+* ``raw_rerank_score`` / ``rerank_score``：chunk rerank 原始分/批内归一化分。
+* ``composite_score``：``0.6*rerank + 0.3*recall + 0.1*summary``，再乘 position prior。
+* ``score``：当前阶段排序主分；rank 完成后等于 ``composite_score``。
+* ``score_trace``：保存上述全部原始值、归一化值、权重与 position prior。
 
-* ``score``          — **当前阶段的主排序分**。在不同阶段含义不同：
-                       - recall/RRF 输出后：rrf 归一化后的初始分；
-                       - select 完成后：filename×w + summary×w 的融合分；
-                       → 下游 shortlist / MMR / 排序均遵循“当前 score”。
-* ``recall_score``   — select 阶段写入的“初始分快照”（select 覆盖 score 前的值），只写不改。
-* ``document_score`` — workflow.py 将 select 输出结果继承到 candidate 时，快照“文档维度的融合分”。
-* ``anchor_score``   — read 阶段：chunk anchor 定位打分（靠 rerank_score 驱动）。
-* ``rerank_score``   — rank 阶段：chunk 级 rerank 分。
-* ``document_match_scores`` — **文档型分数细分项定位事实源**。下游优先从这里取。
-    * ``.filename``            — LLM 文件名估分
-    * ``.summary``             — rerank 模型对文档摘要的打分
-    * ``.final``               — filename×w + summary×w 的融合分（与写入 select 后的 ``score`` 一致）
-    * ``.recall``              — filename×w + summary×w 之前的 rrf 初始分（与 ``recall_score`` 一致）
-    * ``.constraint_*``        — 文件名硬约束判定结果
-“先写入、后读取”：rank / read / 引用等阶段只写自己那一条名字字段，不往已有名字字段上“重写以制造新含义”。
+上下文扩块只替换 MMR 已选 chunk 的 content，不改变任何分数或顺序。
 """
 
 from __future__ import annotations
@@ -56,6 +48,10 @@ class Candidate:
     source: str = "internal"          # "internal" | "web"
     source_query: str = ""
     query_type: str = "hybrid"        # "hybrid" | "vector" | "keyword" | "web"
+    recall_score: float = 0.0
+    document_score: float = 0.0
+    summary_score: float = 0.0
+    document_match_scores: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +66,10 @@ class Candidate:
             "source": self.source,
             "source_query": self.source_query,
             "query_type": self.query_type,
+            "recall_score": self.recall_score or self.score,
+            "document_score": self.document_score,
+            "summary_score": self.summary_score,
+            "document_match_scores": self.document_match_scores,
         }
 
     @classmethod
@@ -87,6 +87,7 @@ class Candidate:
             source=source,
             source_query=getattr(sr, "source_query", ""),
             query_type=getattr(sr, "query_type", "hybrid"),
+            recall_score=sr.score,
         )
 
 
@@ -116,6 +117,7 @@ class RewriteResult:
     keywords: list[str] = field(default_factory=list)
     sub_queries: list[str] = field(default_factory=list)
     rewrite_query: str = ""
+    bm25_query: str = ""
     doc_query: str = ""
     analysis_query: str = ""
     doc_queries: list[str] = field(default_factory=list)
@@ -126,6 +128,7 @@ class RewriteResult:
             "keywords": self.keywords,
             "sub_queries": self.sub_queries,
             "rewrite_query": self.rewrite_query,
+            "bm25_query": self.bm25_query,
             "doc_query": self.doc_query,
             "analysis_query": self.analysis_query,
             "doc_queries": self.doc_queries,
@@ -136,16 +139,16 @@ def new_instance_data(
     query: str,
     source: str = "auto",
     filters: dict[str, Any] | None = None,
-    hints: dict[str, Any] | None = None,
     max_retries: int = DEFAULT_QUALITY_MAX_RETRIES,
+    enable_evaluation: bool = True,
 ) -> dict[str, Any]:
     """创建空白 instance_data（``start`` transition 的 effect 调用）。"""
     return {
         "query": query,
         "source": source,
         "filters": filters or {},
-        "hints": hints or {},
         "max_retries": max_retries,
+        "enable_evaluation": enable_evaluation,
         "rewrite": None,              # RewriteResult.to_dict() | None
         "retrieval_context": None,    # 首轮 rewrite 固化的不可变检索前提
         "route": None,                # "rag" | "web" | "no_retrieval" | "web_unavailable"

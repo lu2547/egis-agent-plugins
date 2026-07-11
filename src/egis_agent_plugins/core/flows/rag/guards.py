@@ -113,7 +113,7 @@ def _route_web(ictx: InstanceCtx) -> None:
 
 
 def _route_rag(ictx: InstanceCtx) -> None:
-    """RAG route: select documents, recall chunks, then read by doc size."""
+    """RAG route: select documents, recall chunks, MMR, then expand anchors."""
     if ictx.probing:
         return
     rewrite = ictx.instance_data.get("rewrite") or {}

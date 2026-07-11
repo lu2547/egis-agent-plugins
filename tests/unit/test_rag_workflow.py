@@ -70,110 +70,42 @@ class TestChitchatGuard:
         _is_obvious_no_retrieval(ictx)
 
 
-class TestDocumentQueryPlan:
-    def test_rewrite_parses_multi_turn_context_decision(self) -> None:
+class TestLightweightRewrite:
+    async def test_rewrite_only_tokenizes_atomic_query(self) -> None:
         from egis_agent_plugins.core.flows.rag.stages.rewrite.service import QueryRewriteService
 
-        service = object.__new__(QueryRewriteService)
-        service._max_sub_queries = 4
-        result = service._parse_response(json.dumps({
-            "resolved_query": "基于既有报告增加多维表格对比",
-            "rewrite_query": "既有报告",
-            "doc_query": "既有报告",
-            "analysis_query": "增加多维表格对比",
-            "sub_queries": ["多维数据表格"],
-            "doc_queries": ["既有报告"],
-            "intent": "rag",
-            "continues_previous_rag": True,
-            "reuse_previous_documents": True,
-        }), "多点表格比对")
+        result = await QueryRewriteService().rewrite("平安养老险 2024年 资产规模")
 
-        assert result.resolved_query == "基于既有报告增加多维表格对比"
-        assert result.continues_previous_rag is True
-        assert result.reuse_previous_documents is True
-
-    def test_rewrite_preserves_range_and_all_year_queries(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.rewrite.service import QueryRewriteService
-
-        # _parse_response only needs the configured sub-query limit; no model call.
-        service = object.__new__(QueryRewriteService)
-        service._max_sub_queries = 4
-        result = service._parse_response(json.dumps({
-            "rewrite_query": "企业年金近五年数据报告",
-            "doc_query": "企业年金数据报告",
-            "analysis_query": "企业年金近五年数据趋势",
-            "sub_queries": ["企业年金数据报告"],
-            "intent": "rag",
-            "doc_queries": [
-                "企业年金最近五个完整自然年数据报告",
-                "企业年金2025年数据报告",
-                "企业年金2024年数据报告",
-                "企业年金2023年数据报告",
-                "企业年金2022年数据报告",
-                "企业年金2021年数据报告",
-            ],
-        }), "企业年金最近五年数据报告")
-
-        assert len(result.doc_queries) == 6
-        assert result.doc_queries[0] == "企业年金最近五个完整自然年数据报告"
-        assert result.doc_queries[-1] == "企业年金2021年数据报告"
-
-    def test_object_doc_queries_are_not_supported(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.rewrite.service import QueryRewriteService
-
-        service = object.__new__(QueryRewriteService)
-        service._max_sub_queries = 4
-        result = service._parse_response(json.dumps({
-            "rewrite_query": "测试报告",
-            "doc_query": "测试报告",
-            "analysis_query": "分析测试报告",
-            "intent": "rag",
-            "doc_queries": [{"query": "旧对象格式"}],
-        }), "测试报告")
-
-        assert result.doc_queries == ["测试报告"]
+        assert result.rewrite_query == "平安养老险 2024年 资产规模"
+        assert result.sub_queries == ["平安养老险 2024年 资产规模"]
+        assert result.doc_queries == ["平安养老险 2024年 资产规模"]
+        assert " " in result.bm25_query
+        assert "同义词" not in result.bm25_query
 
 
 class TestDocumentSelectRRF:
     def test_summary_and_metadata_results_are_fused_by_knowledge_id(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _rrf_merge_documents
+        from egis_agent_plugins.core.flows.rag._services.scope_adapter import RecallScope
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _rrf_merge
 
-        result = _rrf_merge_documents(
+        result = _rrf_merge(
             [
-                ("summary", [
-                    {"knowledge_id": "both", "score": 0.9},
-                    {"knowledge_id": "summary-only", "score": 0.8},
-                ]),
-                ("metadata", [
-                    {"knowledge_id": "metadata-only", "score": 0.9},
-                    {"knowledge_id": "both", "score": 0.8},
-                ]),
+                {"knowledge_id": "both", "hybrid_score": 0.9},
+                {"knowledge_id": "summary-only", "hybrid_score": 0.8},
             ],
-            rrf_k=60,
+            [
+                {"knowledge_id": "metadata-only", "hybrid_score": 0.9},
+                {"knowledge_id": "both", "hybrid_score": 0.8},
+            ],
             query="指定条件的报告",
+            rrf_k=60,
+            scope=RecallScope(kb_id="kb-1"),
         )
 
         assert result[0]["knowledge_id"] == "both"
-        assert set(result[0]["initial_recall_components"]["routes"]) == {"summary", "metadata"}
-
-    def test_independent_query_scores_are_not_added(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _union_query_candidates
-
-        selected, coverage = _union_query_candidates([
-            ("产品A报告", [
-                {"knowledge_id": "shared", "score": 0.6},
-                {"knowledge_id": "a-only", "score": 0.9},
-            ]),
-            ("产品B报告", [
-                {"knowledge_id": "shared", "score": 0.7},
-                {"knowledge_id": "b-only", "score": 0.8},
-            ]),
-        ])
-
-        by_id = {item["knowledge_id"]: item for item in selected}
-        assert by_id["shared"]["score"] == 0.7
-        assert coverage["产品A报告"] == ["shared", "a-only"]
-        assert coverage["产品B报告"] == ["shared", "b-only"]
+        assert result[0]["document_match_scores"]["summary_recall"] > 0
+        assert result[0]["document_match_scores"]["metadata_recall"] > 0
+        assert result[0]["score"] == result[0]["document_score"]
 
 
 class TestEvidenceBudget:
@@ -206,6 +138,36 @@ class TestEvidenceBudget:
         assert [item["chunk_id"] for item in pool] == ["c1"]
         assert [item["chunk_id"] for item in workflow._evidence_pools["pool-test"]] == ["c1"]
         assert "evidence_archive" not in ictx.instance_data
+
+    async def test_evaluation_switch_skips_llm_evaluator_and_marks_first_pass_complete(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import egis_agent_plugins.core.flows.rag.workflow as workflow_module
+        from egis_agent_plugins.core.flows.rag.schema import new_instance_data
+        from egis_agent_plugins.core.flows.rag.workflow import RagRetrievalWorkflow
+
+        async def fake_read_ranked_context(**_: Any) -> list[dict[str, Any]]:
+            return [{
+                "chunk_id": "chunk-1", "knowledge_id": "doc-1",
+                "knowledge_title": "2025年年度报告", "content": "总资产为100亿元。",
+                "score": 0.9,
+            }]
+
+        async def evaluator_must_not_run(**_: Any) -> dict[str, Any]:
+            raise AssertionError("evaluation switch is off; evaluator must not run")
+
+        monkeypatch.setattr(workflow_module, "read_ranked_context", fake_read_ranked_context)
+        monkeypatch.setattr(workflow_module, "_evaluate_run", evaluator_must_not_run)
+        data = new_instance_data("公司A 2025年总资产", enable_evaluation=False)
+        data["ranked"] = [{"chunk_id": "chunk-1", "knowledge_id": "doc-1"}]
+        workflow = RagRetrievalWorkflow(clients=object())
+
+        await workflow._ef_read_and_evaluate(_make_ictx(instance_data=data))
+
+        assert data["evidence_sufficient"] is True
+        assert data["quality_evaluation"]["skipped"] is True
+        assert data["quality_evaluation"]["retry_queries"] == []
 
 
 class TestQualityEvaluation:
@@ -430,7 +392,7 @@ class TestQualityEvaluation:
         assert ictx.instance_data["rewrite"]["analysis_query"] == "比较产品A和产品B"
         assert ictx.instance_data["evidence"] == []
 
-    def test_retry_round_runs_only_atomic_gap_queries(self) -> None:
+    def test_retry_round_caps_gap_queries_at_three(self) -> None:
         from egis_agent_plugins.core.flows.rag.workflow import RagRetrievalWorkflow
 
         workflow = RagRetrievalWorkflow()
@@ -438,15 +400,12 @@ class TestQualityEvaluation:
         ictx = _make_ictx(instance_data={
             "attempt": 1,
             "query": "original analysis question",
-            "rewrite": {
-                "analysis_query": "incorrectly joined query",
-                "sub_queries": queries,
-            },
+            "rewrite": {"sub_queries": queries},
         })
 
-        assert workflow._rag_queries(ictx) == queries
+        assert workflow._rag_queries(ictx) == queries[:3]
 
-    async def test_multi_query_rerank_keeps_queries_independent(self) -> None:
+    async def test_atomic_rerank_builds_composite_score_trace(self) -> None:
         from egis_agent_plugins.core.flows.rag.stages.rank.stage import run
 
         class FakeRerank:
@@ -457,25 +416,32 @@ class TestQualityEvaluation:
 
             async def rerank(self, query: str, passages: list[str]) -> list[Any]:
                 self.calls.append(query)
-                index = 0 if query == "slice-a" else 1
-                return [SimpleNamespace(index=index, score=0.9, content=passages[index])]
+                return [
+                    SimpleNamespace(index=0, score=0.9),
+                    SimpleNamespace(index=1, score=0.1),
+                ]
 
         rerank = FakeRerank()
         result = await run(
-            clients=SimpleNamespace(rerank=rerank),
+            clients=SimpleNamespace(rerank=rerank, postgres=None),
             args={
-                "queries": ["slice-a", "slice-b"],
+                "queries": ["one atomic query", "must be ignored"],
                 "top_k": 2,
                 "candidates": [
-                    {"chunk_id": "a", "content": "content a", "score": 0.5},
-                    {"chunk_id": "b", "content": "content b", "score": 0.5},
+                    {"chunk_id": "a", "content": "content a", "score": 0.5, "recall_score": 0.5, "document_score": 0.8},
+                    {"chunk_id": "b", "content": "content b", "score": 0.25, "recall_score": 0.25, "document_score": 0.2},
                 ],
             },
         )
 
-        assert set(rerank.calls) == {"slice-a", "slice-b"}
-        assert "slice-a slice-b" not in rerank.calls
-        assert {item["chunk_id"] for item in result["ranked"]} == {"a", "b"}
+        assert rerank.calls == ["one atomic query"]
+        assert result["ranked"][0]["chunk_id"] == "a"
+        assert result["ranked"][0]["composite_score"] == pytest.approx(0.98)
+        assert result["ranked"][0]["score_trace"]["weights"] == {
+            "rerank": 0.6,
+            "recall": 0.3,
+            "summary": 0.1,
+        }
 
     async def test_retry_reuses_locked_document_scope(self) -> None:
         from egis_agent_plugins.core.flows.rag.workflow import RagRetrievalWorkflow
@@ -519,7 +485,7 @@ class TestQualityEvaluation:
         assert ictx.instance_data["selected_knowledge_ids"] == [
             "report-2023", "report-2024", "report-2025",
         ]
-        assert ictx.instance_data["document_read_mode"] == "per_document_read"
+        assert ictx.instance_data["document_read_mode"] == "global_chunk_rerank"
 
     def test_default_quality_rounds_is_five(self) -> None:
         from egis_agent_plugins.core.flows.rag.schema import DEFAULT_QUALITY_MAX_ROUNDS
@@ -827,177 +793,26 @@ class TestTypes:
 # ────────────────────────────────────────────────────────────
 
 
-class TestDocumentSelection:
-    def test_filename_match_response_requires_constraint_decision(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import (
-            _parse_filename_score_response,
-        )
+class TestDeterministicSelectionAndScoring:
+    def test_selection_has_no_filename_llm_or_weight_strategy(self) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select import stage
 
-        parsed = _parse_filename_score_response(json.dumps({
-            "scores": [
-                {
-                    "index": 0,
-                    "score": 0.02,
-                    "constraint_applies": True,
-                    "constraint_matched": False,
-                    "constraint_reason": "要求数据报告，文件名是风控管理材料",
-                },
-            ],
-        }), 1)
+        assert not hasattr(stage, "_filename_score_llm")
+        assert not hasattr(stage, "_document_match_strategy")
+        assert not hasattr(stage, "_shortlist_documents")
 
-        assert parsed == [{
-            "score": 0.02,
-            "constraint_applies": True,
-            "constraint_matched": False,
-            "constraint_reason": "要求数据报告，文件名是风控管理材料",
-        }]
+    def test_position_prior_is_bounded_to_five_percent(self) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.rank.stage import _position_prior
 
-    def test_shortlist_hard_rejects_source_constraint_mismatch(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _shortlist_documents
-
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "3")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.85")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY", "score")
-        docs = [
-            {
-                "knowledge_id": "wrong",
-                "score": 0.99,
-                "file_name": "平安养老险年金风控管理V5.docx",
-                "document_match_scores": {
-                    "constraint_applies": True,
-                    "constraint_matched": False,
-                    "constraint_reason": "文档类型不匹配",
-                },
-            },
-            {
-                "knowledge_id": "report",
-                "score": 0.80,
-                "file_name": "全国企业年金基金业务数据摘要2025年度.pdf",
-                "document_match_scores": {
-                    "constraint_applies": True,
-                    "constraint_matched": True,
-                },
-            },
-        ]
-
-        selected, rejected, thresholds = _shortlist_documents(docs)
-
-        assert [doc["knowledge_id"] for doc in selected] == ["report"]
-        assert [doc["knowledge_id"] for doc in rejected] == ["wrong"]
-        assert thresholds["best_score"] == 0.80
-        assert thresholds["constraint_rejected_documents"] == 1
-        assert thresholds["constraint_mode"] == "hard"
-
-    def test_shortlist_keeps_constraint_mismatched_in_summary_mode(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """summary/balanced 档下，constraint_matched=False 也不应被硬踢：
-        用户问“分析平安养老险近三年资产规模变化”时，“全国企业年金
-        基金业务数据摘要”这类行业合集不会在文件名里挂“平安”，
-        应该靠 summary 分保留，而不能因 constraint LLM 把实体当硬限制全卡。
-        """
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _shortlist_documents
-
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "3")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.85")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY", "score")
-        docs = [
-            {
-                "knowledge_id": "industry_report",
-                "score": 0.86,
-                "file_name": "全国企业年金基金业务数据摘要2024年度.pdf",
-                "document_match_scores": {
-                    "constraint_applies": True,
-                    "constraint_matched": False,
-                    "constraint_reason": "文件名未命中实体平安养老险",
-                },
-            },
-        ]
-
-        selected, rejected, thresholds = _shortlist_documents(docs, preference="summary")
-
-        assert [doc["knowledge_id"] for doc in selected] == ["industry_report"]
-        assert rejected == []
-        assert thresholds["constraint_rejected_documents"] == 0
-        assert thresholds["constraint_mode"] == "soft"
-
-    def test_document_match_strategy_defaults_to_filename_heavy(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _document_match_strategy
-
-        monkeypatch.delenv("RAG_DOCUMENT_MATCH_PREFERENCE", raising=False)
-        monkeypatch.delenv("RAG_DOCUMENT_SELECT_FILENAME_WEIGHT", raising=False)
-        monkeypatch.delenv("RAG_DOCUMENT_SELECT_SUMMARY_WEIGHT", raising=False)
-
-        strategy = _document_match_strategy({})
-
-        assert strategy["document_match_preference"] == "filename"
-        assert strategy["weights"] == {"filename": 0.8, "summary": 0.2}
-
-    def test_document_match_strategy_allows_env_weight_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _document_match_strategy
-
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FILENAME_WEIGHT", "8")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_SUMMARY_WEIGHT", "2")
-
-        strategy = _document_match_strategy({"document_match_preference": "summary"})
-
-        assert strategy["document_match_preference"] == "summary"
-        assert strategy["weights"] == {"filename": 0.8, "summary": 0.2}
-
-    def test_shortlist_uses_mmr_for_diverse_documents(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _shortlist_documents
-
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "2")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.95")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY", "mmr")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MMR_LAMBDA", "0.5")
-
-        docs = [
-            {"knowledge_id": "a", "score": 1.0, "file_name": "养老险产品介绍.pdf", "content": "养老险 产品 介绍 账户 权益"},
-            {"knowledge_id": "b", "score": 0.99, "file_name": "养老险产品介绍副本.pdf", "content": "养老险 产品 介绍 账户 权益"},
-            {"knowledge_id": "c", "score": 0.98, "file_name": "投资报告.pdf", "content": "投资 组合 收益 风险 回撤"},
-        ]
-
-        selected, rejected, thresholds = _shortlist_documents(docs)
-
-        assert [doc["knowledge_id"] for doc in selected] == ["a", "c"]
-        assert [doc["knowledge_id"] for doc in rejected] == ["b"]
-        assert thresholds["diversity_strategy"] == "mmr"
-        assert thresholds["eligible_documents"] == 3
-
-    def test_shortlist_can_keep_score_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import _shortlist_documents
-
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_FINAL_TOP_K", "2")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_MIN_SCORE", "0")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_RELATIVE_SCORE", "0.95")
-        monkeypatch.setenv("RAG_DOCUMENT_SELECT_DIVERSITY_STRATEGY", "score")
-
-        docs = [
-            {"knowledge_id": "a", "score": 1.0, "file_name": "养老险产品介绍.pdf", "content": "养老险 产品 介绍 账户 权益"},
-            {"knowledge_id": "b", "score": 0.99, "file_name": "养老险产品介绍副本.pdf", "content": "养老险 产品 介绍 账户 权益"},
-            {"knowledge_id": "c", "score": 0.98, "file_name": "投资报告.pdf", "content": "投资 组合 收益 风险 回撤"},
-        ]
-
-        selected, rejected, thresholds = _shortlist_documents(docs)
-
-        assert [doc["knowledge_id"] for doc in selected] == ["a", "b"]
-        assert [doc["knowledge_id"] for doc in rejected] == ["c"]
-        assert thresholds["diversity_strategy"] == "score"
+        assert 0.95 <= _position_prior(0, 100) <= 1.05
+        assert 0.95 <= _position_prior(99, 100) <= 1.05
+        assert _position_prior(0, 100) > _position_prior(99, 100)
+        assert _position_prior(-1, 100) == 1.0
 
 
 # ────────────────────────────────────────────────────────────
 # 5. Progress
 # ────────────────────────────────────────────────────────────
-
-
 class TestProgress:
     def test_emit_progress_with_emitter(self) -> None:
         from egis_agent_plugins.core.flows.rag.events import emit_progress, PROGRESS_EVENT
@@ -1015,6 +830,40 @@ class TestProgress:
         # Should not raise
         emit_progress(None, tool="test", status="done")
         emit_progress({}, tool="test", status="done")
+
+    def test_research_progress_is_correlated_and_compact(self) -> None:
+        from egis_agent_plugins.core.flows.rag.events import emit_progress, FRONTEND_DIGEST_EVENT
+
+        events: list[dict] = []
+        context = {
+            "emit_event": events.append,
+            "temp:research_trace": {
+                "project_id": "p1",
+                "turn": 3,
+                "phase": "collecting",
+                "step": "collect",
+                "task_id": "u-2024",
+                "query": "公司 A 2024 年企业数",
+            },
+        }
+        emit_progress(
+            context,
+            tool="document_select",
+            status="done",
+            count=6,
+            extra={"selected": [{"title": f"doc-{index}", "content": "x" * 5000} for index in range(6)]},
+        )
+
+        raw = events[0]
+        assert raw["key"] == "research:p1:3:u-2024:document_select"
+        assert raw["query"] == "公司 A 2024 年企业数"
+        assert "selected" not in raw
+        assert raw["document_titles"] == ["doc-0", "doc-1", "doc-2"]
+        digest = next(event for event in events if event.get("custom_type") == FRONTEND_DIGEST_EVENT)
+        step = digest["custom_data"]["step"]
+        assert step["turn"] == 3
+        assert step["phase"] == "collecting"
+        assert step["count"] == 6
 
     def test_emit_references(self) -> None:
         from egis_agent_plugins.core.flows.rag.events import emit_references, REFERENCES_EVENT
@@ -1041,177 +890,26 @@ class TestProgress:
 
 
 class TestUserSelectedShortcut:
-    """前端已圈定文件时，select stage 应直接短路返回，
-    不走 filename 打分 / summary rerank / constraint kill。
-    """
+    def test_selected_file_names_are_read_from_authorized_scope(self) -> None:
+        from egis_agent_plugins.core.flows.rag.stages.select.stage import _selected_file_names
 
-    def test_collect_file_name_map_from_filters(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import (
-            _collect_file_name_map,
-        )
-
-        args = {
-            "filters": {
-                "rag_filter": [
-                    {
-                        "kb_id": "kb1",
-                        "kb_name": "年金业务",
-                        "tags": [
-                            {
-                                "tag_id": "t1",
-                                "tag_name": "人设",
-                                "files": [
-                                    {"id": "f1", "name": "2023年度数据摘要.pdf"},
-                                    {"id": "f2", "name": "2024年度数据摘要.pdf"},
-                                ],
-                            },
-                        ],
-                        "files": [
-                            {"id": "f3", "name": "2025年度数据摘要.pdf"},
-                        ],
-                    }
-                ],
-            },
-        }
-
-        mapping = _collect_file_name_map(args, ctx={})
-
-        assert mapping == {
-            "f1": "2023年度数据摘要.pdf",
-            "f2": "2024年度数据摘要.pdf",
-            "f3": "2025年度数据摘要.pdf",
-        }
-
-    def test_collect_file_name_map_falls_back_to_ctx_rag_state(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import (
-            _collect_file_name_map,
-        )
-
-        ctx = {
-            "user:rag_state": {
-                "rag_filter": [
-                    {
-                        "kb_id": "kb1",
-                        "tags": [
-                            {
-                                "tag_id": "t1",
-                                "files": [{"id": "fx", "name": "only-in-ctx.pdf"}],
-                            }
-                        ],
-                    }
-                ],
-            }
-        }
-
-        mapping = _collect_file_name_map(args={}, ctx=ctx)
-
-        assert mapping == {"fx": "only-in-ctx.pdf"}
-
-    def test_build_user_selected_result_shape(self) -> None:
-        from egis_agent_plugins.core.flows.rag.stages.select.stage import (
-            _build_user_selected_result,
-            _document_match_strategy,
-        )
-        from egis_agent_plugins.core.flows.rag._services.scope_adapter import (
-            scope_plan_from_filters,
-        )
-
-        rag_filter = [
-            {
+        mapping = _selected_file_names({
+            "rag_filter": [{
                 "kb_id": "kb1",
-                "kb_name": "年金业务",
-                "tags": [
-                    {
-                        "tag_id": "t1",
-                        "files": [
-                            {"id": "f1", "name": "2023.pdf"},
-                            {"id": "f2", "name": "2024.pdf"},
-                        ],
-                    }
-                ],
-            }
-        ]
-        scope_plan = scope_plan_from_filters({"rag_filter": rag_filter})
-        strategy = _document_match_strategy({"document_match_preference": "summary"})
+                "tags": [{"tag_id": "t1", "files": [{"id": "f1", "name": "2023.pdf"}]}],
+                "files": [{"id": "f2", "name": "2024.pdf"}],
+            }],
+        }, ctx={})
 
-        result = _build_user_selected_result(
-            query="分析近三年平安养老险资产规模变化趋势",
-            document_queries=["平安养老险 2023 年报告"],
-            document_match_strategy=strategy,
-            scope_plan=scope_plan,
-            user_selected_ids=["f1", "f2"],
-            file_name_by_id={"f1": "2023.pdf", "f2": "2024.pdf"},
-        )
+        assert mapping == {"f1": "2023.pdf", "f2": "2024.pdf"}
 
-        assert result["count"] == 2
-        assert result["knowledge_ids"] == ["f1", "f2"]
-        assert result["knowledge_base_ids"] == ["kb1"]
-        assert result["document_select_thresholds"]["mode"] == "user_selected_direct"
-        # 选中的文档应带标记，下游 workflow 就能在 trace 中看到“用户直选”，
-        # 而非误以为是 LLM 选的。
-        titles = [doc["knowledge_title"] for doc in result["documents"]]
-        assert titles == ["2023.pdf", "2024.pdf"]
-        for doc in result["documents"]:
-            assert doc["document_match_scores"]["user_directly_selected"] is True
-            assert doc["document_match_strategy"]["user_directly_selected"] is True
-            assert doc["knowledge_base_id"] == "kb1"
-
-    def test_inject_frontend_filters_defaults_hints_to_summary(self) -> None:
+    def test_frontend_filter_injection_does_not_create_strategy_hints(self) -> None:
         from egis_agent_plugins.core.flows.rag.tool import RagTool
 
         args: dict[str, Any] = {"query": "q"}
-        ctx = {
-            "user:rag_state": {
-                "rag_filter": [
-                    {
-                        "kb_id": "kb1",
-                        "files": [{"id": "f1", "name": "a.pdf"}],
-                    }
-                ],
-            }
-        }
+        ctx = {"user:rag_state": {"rag_filter": [{"kb_id": "kb1", "files": [{"id": "f1"}]}]}}
 
         filters = RagTool._inject_frontend_filters(args=args, ctx=ctx)
 
-        assert "rag_filter" in filters
-        assert args["filters"]["rag_filter"][0]["kb_id"] == "kb1"
-        assert args["hints"]["document_match_preference"] == "summary"
-
-    def test_inject_frontend_filters_preserves_explicit_llm_hints(self) -> None:
-        from egis_agent_plugins.core.flows.rag.tool import RagTool
-
-        args: dict[str, Any] = {
-            "query": "q",
-            "hints": {"document_match_preference": "filename", "reason": "user指定文件名"},
-        }
-        ctx = {
-            "user:rag_state": {
-                "rag_filter": [
-                    {
-                        "kb_id": "kb1",
-                        "files": [{"id": "f1", "name": "a.pdf"}],
-                    }
-                ],
-            }
-        }
-
-        RagTool._inject_frontend_filters(args=args, ctx=ctx)
-
-        # 不覆盖 LLM 已显式传入的偏好。
-        assert args["hints"]["document_match_preference"] == "filename"
-        assert args["hints"]["reason"] == "user指定文件名"
-
-    def test_inject_frontend_filters_without_rag_filter_leaves_hints_untouched(
-        self,
-    ) -> None:
-        from egis_agent_plugins.core.flows.rag.tool import RagTool
-
-        args: dict[str, Any] = {"query": "q"}
-        ctx: dict[str, Any] = {}
-
-        RagTool._inject_frontend_filters(args=args, ctx=ctx)
-
-        # 前端未圈定时，不强塑 preference；交回 _document_match_strategy 默认。
-        assert "hints" not in args or not args["hints"].get(
-            "document_match_preference"
-        )
+        assert filters["rag_filter"][0]["kb_id"] == "kb1"
+        assert "hints" not in args

@@ -1,4 +1,4 @@
-"""Ranking stage — rerank, threshold, and MMR ordering."""
+"""Chunk rerank, composite scoring, and greedy MMR."""
 
 from __future__ import annotations
 
@@ -14,147 +14,53 @@ from egis_agent_plugins.core.flows.rag.stages.rank.mmr import apply_mmr
 logger = logging.getLogger(__name__)
 
 
-async def _apply_rerank(
-    clients: RAGClients,
-    *,
-    queries: list[str],
-    candidates: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Apply external rerank to the top candidate slice."""
+def _normalize(values: list[float]) -> list[float]:
+    """Max-normalize non-negative retrieval scores while preserving zero."""
+    cleaned = [max(0.0, float(value or 0.0)) for value in values]
+    maximum = max(cleaned, default=0.0)
+    return [value / maximum if maximum > 0 else 0.0 for value in cleaned]
+
+
+async def _rerank(clients: RAGClients, query: str, candidates: list[dict[str, Any]]) -> list[float]:
+    if not candidates:
+        return []
     if not clients.rerank or not clients.rerank.enabled:
-        return candidates
-
-    rerank_topn = int(os.getenv("RAG_RERANK_TOPN", "30"))
-    rerank_timeout = float(os.getenv("RAG_RERANK_TIMEOUT_S", "5"))
-
-    head = [dict(c) for c in candidates[:rerank_topn]]
-    tail = candidates[rerank_topn:]
-    passages = [c.get("content", "") for c in head]
-
-    effective_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
-    if not effective_queries:
-        return candidates
-    default_concurrency = os.getenv("RAG_RETRIEVAL_CONCURRENCY", "6")
-    sem = asyncio.Semaphore(max(
-        1,
-        int(os.getenv("RAG_RERANK_QUERY_CONCURRENCY", default_concurrency)),
-    ))
-
-    async def _rerank_one(query: str) -> tuple[str, list[Any]]:
-        async with sem:
-            results = await asyncio.wait_for(
-                clients.rerank.rerank(query, passages),
-                timeout=rerank_timeout,
-            )
-        return query, results
-
-    query_results = await asyncio.gather(
-        *(_rerank_one(query) for query in effective_queries),
-        return_exceptions=True,
+        return [float(item.get("recall_score", item.get("score", 0.0)) or 0.0) for item in candidates]
+    timeout = float(os.getenv("RAG_RERANK_TIMEOUT_S", "8"))
+    results = await asyncio.wait_for(
+        clients.rerank.rerank(query, [str(item.get("content") or "") for item in candidates]),
+        timeout=timeout,
     )
-    merged: dict[int, dict[str, Any]] = {}
-    successful_queries = 0
-    for result in query_results:
-        if isinstance(result, asyncio.TimeoutError):
-            logger.warning(
-                "[Rank] one query rerank timed out after %.1fs; continuing other queries",
-                rerank_timeout,
-            )
+    scores = [0.0] * len(candidates)
+    for item in results:
+        if 0 <= item.index < len(scores):
+            scores[item.index] = float(item.score or 0.0)
+    return scores
+
+
+async def _attach_chunk_metadata(clients: RAGClients, candidates: list[dict[str, Any]]) -> None:
+    pg = getattr(clients, "postgres", None)
+    if pg is None:
+        return
+    await pg.connect()
+    chunks = await pg.get_chunks_by_ids([str(item.get("chunk_id") or item.get("id") or "") for item in candidates])
+    by_id = {item.id: item for item in chunks}
+    for candidate in candidates:
+        chunk = by_id.get(str(candidate.get("chunk_id") or candidate.get("id") or ""))
+        if chunk is None:
             continue
-        if isinstance(result, Exception):
-            logger.warning("[Rank] one query rerank failed: %s", result)
-            continue
-        query, rerank_results = result
-        successful_queries += 1
-        for query_rank, rr in enumerate(rerank_results, 1):
-            if not 0 <= rr.index < len(head):
-                continue
-            entry = merged.get(rr.index)
-            if entry is None:
-                entry = dict(head[rr.index])
-                entry["rerank_query_matches"] = []
-                merged[rr.index] = entry
-            entry["rerank_query_matches"].append({
-                "query": query,
-                "rank": query_rank,
-                "score": float(rr.score or 0.0),
-            })
-            if float(rr.score or 0.0) >= float(entry.get("rerank_score", 0.0) or 0.0):
-                entry["score"] = rr.score
-                entry["rerank_score"] = rr.score
-                entry["rerank_query"] = query
-            entry["reranked"] = True
-
-    if not successful_queries:
-        return candidates
-    accepted = sorted(
-        merged.values(),
-        key=lambda item: float(item.get("rerank_score", 0.0) or 0.0),
-        reverse=True,
-    )
-
-    logger.debug(
-        "[Rank] rerank accepted=%d dropped=%d tail_dropped=%d",
-        len(accepted),
-        len(head) - len(merged),
-        len(tail),
-    )
-    for item in accepted:
-        logger.debug(
-            "[Rank] ✔ %s  score=%.4f  knowledge_id=%s",
-            item.get("file_name", "unknown"),
-            item.get("rerank_score", 0.0),
-            item.get("knowledge_id", ""),
-        )
-    return accepted
+        candidate["chunk_index"] = chunk.chunk_index
+        candidate["start_at"] = chunk.start_at
+        candidate["end_at"] = chunk.end_at
+        candidate["image_info"] = chunk.image_info
 
 
-def _apply_diversity(candidates: list[dict[str, Any]], *, top_k: int) -> list[dict[str, Any]]:
-    if top_k <= 0 or len(candidates) <= top_k:
-        return candidates
-    selected: list[dict[str, Any]] = []
-    selected_ids: set[int] = set()
-    query_order = list(dict.fromkeys(
-        str(match.get("query") or "")
-        for candidate in candidates
-        for match in candidate.get("rerank_query_matches", [])
-        if str(match.get("query") or "")
-    ))
-    for query in query_order:
-        matching = [
-            item
-            for item in candidates
-            if id(item) not in selected_ids
-            and any(
-                match.get("query") == query
-                for match in item.get("rerank_query_matches", [])
-            )
-        ]
-        candidate = max(
-            matching,
-            key=lambda item: max(
-                float(match.get("score", 0.0) or 0.0)
-                for match in item.get("rerank_query_matches", [])
-                if match.get("query") == query
-            ),
-            default=None,
-        )
-        if candidate is None:
-            continue
-        selected.append(candidate)
-        selected_ids.add(id(candidate))
-        if len(selected) >= top_k:
-            return selected
-
-    remaining = [item for item in candidates if id(item) not in selected_ids]
-    mmr_results = apply_mmr(
-        remaining,
-        relevance_fn=lambda c: float(c.get("score", 0.0)),
-        content_fn=lambda c: c.get("content", ""),
-        k=top_k - len(selected),
-        lambda_=float(os.getenv("RAG_MMR_LAMBDA", "0.7")),
-    )
-    return [*selected, *(mmr_results or remaining[: top_k - len(selected)])]
+def _position_prior(start_at: int, end_at: int) -> float:
+    """Match WeKnora's bounded chunk-position prior exactly."""
+    if start_at < 0 or end_at <= start_at:
+        return 1.0
+    adjustment = 1.0 - float(start_at) / float(end_at + 1)
+    return 1.0 + max(-0.05, min(0.05, adjustment))
 
 
 async def run(
@@ -163,25 +69,73 @@ async def run(
     args: dict[str, Any],
     ctx: dict[str, Any] | None = None,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """Rank candidates and return a diversity-aware ordered list."""
     t0 = time.perf_counter()
-    candidates = list(args.get("candidates") or [])
-    queries = [q for q in (args.get("queries") or []) if q]
-    top_k = int(args.get("top_k") or os.getenv("RAG_RANK_TOP_K", "10"))
-
+    candidates = [dict(item) for item in args.get("candidates") or []]
+    queries = [str(item).strip() for item in args.get("queries") or [] if str(item).strip()]
+    top_k = max(1, int(args.get("top_k") or os.getenv("RAG_RANK_TOP_K", "10")))
     if not candidates:
         return {"ranked": [], "count": 0, "rank_ms": 0}
 
-    reranked = await _apply_rerank(clients, queries=queries, candidates=candidates)
-    reranked.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
-    ranked = _apply_diversity(reranked, top_k=top_k)
+    query = queries[0] if queries else ""
+    await _attach_chunk_metadata(clients, candidates)
+    raw_recall = [float(item.get("recall_score", item.get("score", 0.0)) or 0.0) for item in candidates]
+    raw_rerank = await _rerank(clients, query, candidates)
+    recall_scores = _normalize(raw_recall)
+    rerank_scores = _normalize(raw_rerank)
 
-    elapsed = int((time.perf_counter() - t0) * 1000)
-    logger.debug(
-        "[Rank] candidates=%d accepted=%d ranked=%d cost_ms=%d",
-        len(candidates),
-        len(reranked),
-        len(ranked),
-        elapsed,
+    for index, item in enumerate(candidates):
+        match_scores = item.get("document_match_scores") or {}
+        if "summary_score" in item:
+            summary_value = item.get("summary_score")
+        elif "summary_recall" in match_scores:
+            summary_value = match_scores.get("summary_recall")
+        else:
+            # Compatibility for non-document-selection candidates and older
+            # persisted states that only carried the fused document score.
+            summary_value = item.get("document_score", 0.0)
+        summary_score = float(summary_value or 0.0)
+        prior = _position_prior(int(item.get("start_at", 0) or 0), int(item.get("end_at", 0) or 0))
+        composite_before_prior = 0.6 * rerank_scores[index] + 0.3 * recall_scores[index] + 0.1 * summary_score
+        composite = max(0.0, min(1.0, composite_before_prior * prior))
+        item.update({
+            "raw_recall_score": raw_recall[index],
+            "recall_score": recall_scores[index],
+            "raw_rerank_score": raw_rerank[index],
+            "rerank_score": rerank_scores[index],
+            "summary_score": summary_score,
+            "position_prior": prior,
+            "composite_before_prior": composite_before_prior,
+            "composite_score": composite,
+            "score": composite,
+            "score_trace": {
+                "raw_recall": raw_recall[index],
+                "normalized_recall": recall_scores[index],
+                "raw_rerank": raw_rerank[index],
+                "normalized_rerank": rerank_scores[index],
+                "summary_recall": summary_score,
+                "weights": {"rerank": 0.6, "recall": 0.3, "summary": 0.1},
+                "position_prior": prior,
+                "position": {
+                    "start_at": int(item.get("start_at", 0) or 0),
+                    "end_at": int(item.get("end_at", 0) or 0),
+                },
+                "composite": composite,
+            },
+        })
+
+    candidates.sort(key=lambda item: float(item.get("composite_score", 0.0)), reverse=True)
+    selected = apply_mmr(
+        candidates,
+        relevance_fn=lambda item: float(item.get("composite_score", 0.0)),
+        content_fn=lambda item: str(item.get("content") or ""),
+        k=min(top_k, len(candidates)),
+        lambda_=float(os.getenv("RAG_MMR_LAMBDA", "0.7")),
     )
-    return {"ranked": ranked, "count": len(ranked), "rank_ms": elapsed}
+    for rank, item in enumerate(selected, 1):
+        item["mmr_rank"] = rank
+    elapsed = int((time.perf_counter() - t0) * 1000)
+    logger.info(
+        "[RAG][rank] candidates=%d selected=%d top_composite=%.4f cost_ms=%d",
+        len(candidates), len(selected), float(selected[0]["composite_score"]) if selected else 0.0, elapsed,
+    )
+    return {"ranked": selected, "count": len(selected), "rank_ms": elapsed}

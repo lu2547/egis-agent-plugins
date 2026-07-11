@@ -6,10 +6,10 @@ LLM 不感知阶段边界，一次调用拿到 evidence pack。
 继承 ``AgentTool``（非 ``WorkflowTool``），因为 ``WorkflowTool`` 会
 把每个 transition action 暴露给 LLM，而我们希望 LLM 只看到一次 ``run``。
 
-1. rewrite/analyze: 判断 direct / rag / web，并接收模型 hints
-2. route: rag 先选文档，再在选中文档内召回 chunk；web 走 web search
-3. rank: rerank + MMR 得到 chunk anchors
-4. read: 小文档全文通读；大文档按 anchor 向下扩展短块
+1. rewrite: 仅做轻量分词，为 BM25 生成空格分隔文本
+2. select: summary 与 metadata 两路 hybrid search，经 RRF 选文档
+3. recall/rank: 文档内 hybrid recall → rerank → composite score → MMR
+4. read: 只对 MMR 选中短块做同文档双向上下文扩展
 """
 
 from __future__ import annotations
@@ -52,15 +52,14 @@ class RagTool(AgentTool):
     """
 
     name = "rag"
-    description = """一体化 RAG 检索工具 — 一次调用完成查询改写、多路召回、重排、深度阅读全流程。
+    description = """一体化 RAG 检索工具 — 基于原子问题和资料范围返回可追溯 evidence pack。
 
 功能：
-- 自动识别意图（知识库/网络搜索/文档定向/闲聊）
-- 查询改写（代词消解、子问题拆分）
-- 多路并行召回（向量 + 关键词 RRF 融合）
-- Rerank + MMR 去冗余
-- 深度阅读 + 充分性评估
-- 证据不足时自动扩展重试
+- 轻量分词，不扩写问题
+- summary/metadata 双路 hybrid + RRF 选文档
+- 文档内 hybrid recall、Rerank、综合评分和标准 MMR
+- 仅扩展 MMR 选中的短块
+- 可选的内部充分性评估；关闭时首轮直接返回
 
 输出：结构化证据包（编号 [1]、[2]...，含引用来源和内容摘要），可直接用于回答用户问题。
 回答时用 [N] 标注引用出处，系统会自动将编号映射为真实文档引用。"""
@@ -75,7 +74,7 @@ class RagTool(AgentTool):
         ToolParameter(
             name="source",
             type="string",
-            description="检索来源：auto（自动判断）、internal（仅知识库）、web（仅网络）",
+            description="检索来源：auto/internal 使用知识库；web 显式使用网络检索",
             required=False,
             default="auto",
             enum=["auto", "internal", "web"],
@@ -92,16 +91,15 @@ class RagTool(AgentTool):
             required=False,
         ),
         ToolParameter(
-            name="hints",
-            type="object",
+            name="enable_evaluation",
+            type="boolean",
             description=(
-                "模型对 RAG 策略的语义判断，workflow 会按该 hint 执行并在 trace 中展示。"
-                "document_match_preference: filename|summary|balanced；"
-                "read_preference: full_document|related_chunks|mixed；"
-                "excluded_file_names: 用户明确要求排除的文件名数组；"
-                "reason: 简短原因。"
+                "是否启用 RAG 内部质量评估与补搜，默认 true。"
+                "设为 false 时跳过评估与补搜，首轮检索后直接结束；"
+                "适合由外部 Research Harness 负责覆盖评估的原子事实查询。"
             ),
             required=False,
+            default=True,
         ),
     ]
 
@@ -135,6 +133,20 @@ class RagTool(AgentTool):
             logger.warning("[RagRetrieval] filters 参数无法解析为对象: %s", raw[:200])
             return {}
         return {}
+
+    @staticmethod
+    def _parse_bool(raw: Any, *, default: bool) -> bool:
+        if raw is None:
+            return default
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        return default
 
     @staticmethod
     def _read_frontend_rag_filter(ctx: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -190,19 +202,6 @@ class RagTool(AgentTool):
 
         filters = {"rag_filter": rag_filter}
         args["filters"] = filters
-        # 方案 C 兜底:前端已圈定资料时，LLM 不再需要靠 filename 去筛文件，
-        # 默认走 summary。避免 B 短路阈值超限时走旧路径，constraint kill 把用户
-        # 圈定的文件全禁掉。LLM 已显式传入 hints 时不覆盖。
-        hints_raw = args.get("hints")
-        hints = hints_raw if isinstance(hints_raw, dict) else {}
-        if not str(hints.get("document_match_preference") or "").strip():
-            hints["document_match_preference"] = "summary"
-            args["hints"] = hints
-            logger.info(
-                "[RagRetrieval] frontend rag_filter present, defaulting hints.document_match_preference=summary",
-            )
-        else:
-            args["hints"] = hints
         logger.debug(
             "[RagRetrieval] injected frontend rag_filter into tool filters: scopes=%d",
             len(rag_filter),
@@ -418,15 +417,15 @@ class RagTool(AgentTool):
         query = args.get("query", "")
         source = args.get("source", "auto")
         filters = self._inject_frontend_filters(args=args, ctx=ctx)
-        hints = self._parse_filters(args.get("hints"))
-        max_retries = DEFAULT_QUALITY_MAX_RETRIES
+        enable_evaluation = self._parse_bool(args.get("enable_evaluation"), default=True)
+        max_retries = DEFAULT_QUALITY_MAX_RETRIES if enable_evaluation else 0
 
         if not query.strip():
             return AgentToolResult.error_result(tool_call.id, "query 参数不能为空")
 
         logger.debug(
-            "[RagRetrieval] query=%s, source=%s, max_retries=%d",
-            query[:80], source, max_retries,
+            "[RagRetrieval] query=%s, source=%s, evaluation=%s, max_retries=%d",
+            query[:80], source, enable_evaluation, max_retries,
         )
 
         # Build workflow (stage run 函数直接 import，无需传 tools)
@@ -457,9 +456,29 @@ class RagTool(AgentTool):
         async def _step(action: str, step_args: dict[str, Any] | None = None) -> Any:
             with _tracer.start_as_current_span(f"rag.{action}") as span:
                 span.set_attribute("rag.action", action)
+                research = ctx.get("temp:research_trace") if isinstance(ctx.get("temp:research_trace"), dict) else {}
+                if research:
+                    span.set_attribute("research.project_id", str(research.get("project_id") or ""))
+                    span.set_attribute("research.turn", int(research.get("turn") or 0))
+                    span.set_attribute("research.phase", str(research.get("phase") or "collecting"))
+                    span.set_attribute("research.step", str(research.get("step") or "collect"))
+                    span.set_attribute("research.task_id", str(research.get("task_id") or ""))
+                    span.set_attribute("research.query", str(research.get("query") or "")[:500])
+                span.set_attribute(
+                    "rag.step.input",
+                    json.dumps(step_args or {}, ensure_ascii=False, default=str, separators=(",", ":"))[:1200],
+                )
                 result = await flow.execute(iid, action, step_args or {}, ctx)
                 span.set_attribute("rag.success", result.success)
                 span.set_attribute("rag.new_state", result.new_state or "")
+                span.set_attribute(
+                    "rag.step.output",
+                    json.dumps(
+                        {"success": result.success, "state": result.new_state or "", "digest": str(result.digest or "")[:300]},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
                 if action == "rewrite":
                     self._set_rewrite_trace_attrs(span, result.state_delta, step_args)
                 if action == "branch_recall":
@@ -512,8 +531,8 @@ class RagTool(AgentTool):
             "previous_rag_context": self._read_previous_rag_context(ctx),
             "source": source,
             "filters": filters,
-            "hints": hints,
             "max_retries": max_retries,
+            "enable_evaluation": enable_evaluation,
         }
         result = await _step("rewrite", initial_args)
         if not result.success:

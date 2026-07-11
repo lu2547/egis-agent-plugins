@@ -193,6 +193,7 @@ def _milvus_search_with_embedding(
     clients: RAGClients,
     *,
     query: str,
+    bm25_query: str,
     query_embedding: list[float],
     resolved: ResolvedFilters,
     collection_groups: dict[str, list[str]] | None,
@@ -206,7 +207,7 @@ def _milvus_search_with_embedding(
         search_results = clients.milvus.search_across_collections(
             kb_meta_groups=kb_meta_groups,
             query_embedding=query_embedding,
-            query_text=query,
+            query_text=bm25_query,
             retriever_type=RetrieverType.HYBRID,
             knowledge_ids=resolved.knowledge_ids or None,
             tag_ids=resolved.tag_ids or None,
@@ -398,6 +399,10 @@ async def run(
         if not effective_queries:
             return {"error": "queries 全为空"}
         recall_queries = effective_queries
+        bm25_queries_raw = args.get("bm25_queries") or []
+        bm25_queries = [str(item or "").strip() for item in bm25_queries_raw] if isinstance(bm25_queries_raw, list) else []
+        if len(bm25_queries) != len(recall_queries):
+            bm25_queries = list(recall_queries)
 
         _t_embed = time.perf_counter()
         try:
@@ -425,7 +430,7 @@ async def run(
             int(os.getenv("RAG_SCOPE_RECALL_CONCURRENCY", default_concurrency)),
         ))
 
-        async def _search_scope_query(scope: RecallScope, q: str, emb: list[float]) -> list[SearchResult]:
+        async def _search_scope_query(scope: RecallScope, q: str, bm25_q: str, emb: list[float]) -> list[SearchResult]:
             scope_groups = _collection_groups_for_scope(clients, resolved, scope)
             collection_groups = scope_groups or selected_collection_groups
             filter_expr = scope.to_filter_expr(include_enabled=True)
@@ -443,6 +448,7 @@ async def run(
                     _milvus_search_with_embedding,
                     clients,
                     query=q,
+                    bm25_query=bm25_q,
                     query_embedding=emb,
                     resolved=scope_resolved,
                     collection_groups=collection_groups,
@@ -461,9 +467,9 @@ async def run(
             return results
 
         search_tasks = [
-            _search_scope_query(scope, q, emb)
+            _search_scope_query(scope, q, bm25_q, emb)
             for scope in scopes
-            for q, emb in zip(recall_queries, embeddings)
+            for q, bm25_q, emb in zip(recall_queries, bm25_queries, embeddings)
         ]
         per_query_results = await asyncio.gather(*search_tasks, return_exceptions=True)
         logger.debug("[KS] stage=milvus cost_ms=%d", int((time.perf_counter() - _t_milvus) * 1000))

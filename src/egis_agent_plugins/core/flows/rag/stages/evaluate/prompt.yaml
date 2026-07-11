@@ -13,7 +13,7 @@ system_prompt: |
   === 第二步：按维度打分（0-100，整数） ===
   4 个维度，是否适用取决于 task_type：
 
-  1. task_coverage（任务覆盖）——【所有 task_type 都适用】
+  1. task_coverage（任务覆盖）——【所有 task_type bu'd都适用】
      用户 query 中每个核心任务、对象、限定条件、时间/地区/产品/版本约束是否都能在 evidence 中找到直接对应内容。
 
   2. concept_alignment（口径匹配）——【所有 task_type 都适用】

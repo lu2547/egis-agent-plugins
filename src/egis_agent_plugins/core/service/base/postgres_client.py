@@ -280,6 +280,87 @@ class PostgresClient:
                 for row in rows
             ]
 
+    async def list_knowledge_catalog(
+        self,
+        *,
+        knowledge_base_ids: list[str] | None = None,
+        max_knowledge_bases: int = 12,
+        max_files_per_knowledge_base: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return a compact, read-only KB/tag/file tree for scope selection.
+
+        This is intentionally metadata-only: a planning model needs names and
+        stable IDs to choose a scope, not document content.  Callers must pass
+        the already-authorized KB IDs when access is restricted.
+        """
+        async with self._get_pool().acquire() as conn:
+            if knowledge_base_ids:
+                kb_rows = await conn.fetch(
+                    """
+                    SELECT id_knowledge_base AS id, name, description, category
+                    FROM knowledge_base
+                    WHERE id_knowledge_base = ANY($1) AND deleted_at IS NULL
+                    ORDER BY name ASC
+                    LIMIT $2
+                    """,
+                    knowledge_base_ids,
+                    max_knowledge_bases,
+                )
+            else:
+                kb_rows = await conn.fetch(
+                    """
+                    SELECT id_knowledge_base AS id, name, description, category
+                    FROM knowledge_base
+                    WHERE deleted_at IS NULL
+                    ORDER BY name ASC
+                    LIMIT $1
+                    """,
+                    max_knowledge_bases,
+                )
+
+            catalog: list[dict[str, Any]] = []
+            for kb in kb_rows:
+                kb_id = str(kb["id"])
+                tag_rows = await conn.fetch(
+                    """
+                    SELECT id_knowledge_tag AS id, name
+                    FROM knowledge_tag
+                    WHERE id_knowledge_base = $1 AND deleted_at IS NULL
+                    ORDER BY name ASC
+                    """,
+                    kb_id,
+                )
+                file_rows = await conn.fetch(
+                    """
+                    SELECT id_knowledge AS id, title, file_name, description, file_type
+                    FROM knowledge
+                    WHERE id_knowledge_base = $1 AND deleted_at IS NULL
+                          AND COALESCE(enable_status, '0') = '0'
+                    ORDER BY created_at DESC NULLS LAST, title ASC
+                    LIMIT $2
+                    """,
+                    kb_id,
+                    max_files_per_knowledge_base,
+                )
+                catalog.append({
+                    "kb_id": kb_id,
+                    "kb_name": kb["name"] or "",
+                    "description": kb["description"] or "",
+                    "category": kb["category"] or "",
+                    "tags": [{"tag_id": str(row["id"]), "tag_name": row["name"] or ""} for row in tag_rows],
+                    "files": [
+                        {
+                            "id": str(row["id"]),
+                            "name": row["file_name"] or row["title"] or "",
+                            "title": row["title"] or "",
+                            "description": row["description"] or "",
+                            "type": row["file_type"] or "",
+                        }
+                        for row in file_rows
+                    ],
+                })
+            return catalog
+
     async def get_chunks_by_knowledge_id(
         self,
         knowledge_id: str,
@@ -383,6 +464,35 @@ class PostgresClient:
                     image_info=row["image_info"] or "",
                     tag_id=row["tag_id"] or "",
                     created_at=str(row["created_at"]) if row["created_at"] else "",
+                )
+                for row in rows
+            ]
+
+    async def get_chunks_by_ids(self, chunk_ids: list[str]) -> list["Chunk"]:
+        """Fetch chunk metadata needed for position prior and trace assembly."""
+        ids = list(dict.fromkeys(str(item) for item in chunk_ids if item))
+        if not ids:
+            return []
+        async with self._get_pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id_chunk AS id, content, chunk_index,
+                       id_knowledge AS knowledge_id, id_knowledge_base AS knowledge_base_id,
+                       chunk_type, is_enabled, start_at, end_at, parent_chunk_id,
+                       image_info, tag_id, created_at
+                FROM chunk
+                WHERE id_chunk = ANY($1) AND is_enabled = true AND deleted_at IS NULL
+                """,
+                ids,
+            )
+            return [
+                Chunk(
+                    id=row["id"], content=row["content"] or "", chunk_index=row["chunk_index"],
+                    knowledge_id=row["knowledge_id"], knowledge_base_id=row["knowledge_base_id"],
+                    chunk_type=row["chunk_type"], source_type=0, is_enabled=row["is_enabled"],
+                    start_at=row["start_at"] or 0, end_at=row["end_at"] or 0,
+                    parent_chunk_id=row["parent_chunk_id"] or "", image_info=row["image_info"] or "",
+                    tag_id=row["tag_id"] or "", created_at=str(row["created_at"]) if row["created_at"] else "",
                 )
                 for row in rows
             ]

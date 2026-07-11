@@ -68,10 +68,14 @@ def emit_progress(
         "tool": tool,
         "status": status,
     }
+    research = _research_context(context)
+    if research:
+        event.update(research)
+        event["key"] = f"research:{research.get('project_id', '')}:{research.get('turn', 0)}:{research.get('task_id', '')}:{tool}"
     if count is not None:
         event["count"] = count
     if extra:
-        event.update(extra)
+        event.update(_compact_progress_extra(extra))
 
     frontend_payload = _build_frontend_progress_payload(event)
 
@@ -99,6 +103,9 @@ def emit_references(
         "type": REFERENCES_EVENT,
         "data": references,
     }
+    research = _research_context(context)
+    if research:
+        event.update(research)
     if emitter is not None:
         try:
             emitter(event)
@@ -110,7 +117,8 @@ def emit_references(
                     "tool": "references",
                     "status": "done",
                     "count": len(references),
-                    "references": references[:5],
+                    **research,
+                    "key": f"research:{research.get('project_id', '')}:{research.get('turn', 0)}:{research.get('task_id', '')}:references" if research else "references",
                 }),
             })
         except Exception:
@@ -126,33 +134,86 @@ def _build_frontend_progress_payload(event: dict[str, Any]) -> dict[str, Any]:
     label = str(event.get("label") or _TOOL_LABELS.get(tool, tool))
     detail = str(event.get("detail") or _default_detail(event))
     count = event.get("count")
+    turn = int(event.get("turn", 0) or 0)
+    phase = str(event.get("phase") or "collecting")
+    query = str(event.get("query") or "")
     step = {
         "key": str(event.get("key") or tool),
         "tool": tool,
+        "turn": turn,
+        "phase": phase,
+        "step": str(event.get("research_step") or "collect"),
         "label": label,
         "status": status,
         "status_label": _STATUS_LABELS.get(status, status),
         "detail": detail,
+        "query": query[:160] + ("…" if len(query) > 160 else ""),
         "count": count,
+        "next": str(event.get("next") or ""),
+        "task_id": str(event.get("task_id") or ""),
         "meta": {
             k: v
             for k, v in event.items()
-            if k not in {"type", "tool", "status", "label", "detail", "count"}
+            if k in {"route", "scope_count", "candidate_count", "selected_count", "evidence_count", "missing_count", "document_titles"}
         },
     }
+    summary = f"Turn {turn} · {label} · {detail}" if turn else detail or label
+    view_status = {
+        "pending": "loading",
+        "done": "success",
+        "skipped": "info",
+        "error": "error",
+    }.get(status, "info")
     return {
         "tool_name": "rag_progress",
         "display_type": "search",
         "display_mode": "minimal",
         "view": {
-            "title": "知识库检索过程",
-            "summary": detail or label,
-            "status": status,
+            "title": "研究检索" if turn else "知识库检索过程",
+            "summary": summary,
+            "status": view_status,
             "step": step,
         },
         "sections": [],
         "step": step,
     }
+
+
+def _research_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    raw = (context or {}).get("temp:research_trace")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        "project_id": str(raw.get("project_id") or ""),
+        "turn": int(raw.get("turn") or 0),
+        "phase": str(raw.get("phase") or "collecting"),
+        "research_step": str(raw.get("step") or "collect"),
+        "task_id": str(raw.get("task_id") or ""),
+        "query": str(raw.get("query") or ""),
+    }
+
+
+def _compact_progress_extra(extra: dict[str, Any]) -> dict[str, Any]:
+    """Keep progress diagnostic, not full retrieval payloads."""
+    compact = {
+        key: extra[key]
+        for key in ("route", "scope_count", "candidate_count", "selected_count", "evidence_count", "reason", "error", "next")
+        if key in extra
+    }
+    documents = extra.get("documents") or extra.get("selected") or extra.get("by_document") or []
+    if isinstance(documents, list):
+        titles = []
+        for item in documents[:3]:
+            if isinstance(item, dict):
+                title = item.get("title") or item.get("knowledge_title") or item.get("file_name")
+                if title:
+                    titles.append(str(title))
+        if titles:
+            compact["document_titles"] = titles
+    missing = extra.get("missing_points") or []
+    if isinstance(missing, list) and missing:
+        compact["missing_count"] = len(missing)
+    return compact
 
 
 def _default_detail(event: dict[str, Any]) -> str:
