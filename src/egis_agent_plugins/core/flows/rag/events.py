@@ -165,6 +165,8 @@ def _build_frontend_progress_payload(event: dict[str, Any]) -> dict[str, Any]:
         "error": "error",
     }.get(status, "info")
     return {
+        "schema": "egis.research_progress.v2",
+        "schema_version": 2,
         "tool_name": "rag_progress",
         "display_type": "search",
         "display_mode": "minimal",
@@ -176,6 +178,19 @@ def _build_frontend_progress_payload(event: dict[str, Any]) -> dict[str, Any]:
         },
         "sections": [],
         "step": step,
+        "round": {
+            "number": turn,
+            "phase": phase,
+            "status": status,
+        },
+        "event": {
+            "kind": "rag_stage",
+            "unit_id": str(event.get("task_id") or ""),
+            "stage": tool,
+            "summary": detail,
+            "count": count,
+            "meta": step["meta"],
+        },
     }
 
 
