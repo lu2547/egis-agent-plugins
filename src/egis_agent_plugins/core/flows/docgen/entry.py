@@ -10,7 +10,6 @@
   select_pension_intro(idle → routed)   养老险 → 建项目 → 路由
   select_investment_report(idle → routed) 投资报告 → 建项目 → 路由
   select_word(idle → routed)            AI Word → 路由
-  select_ppt(idle → routed)             AI PPT → 路由
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ class SelectModeArgs(BaseModel):
 
 class SelectTemplateArgs(BaseModel):
     template_id: str = Field(
-        description="模板 ID，如 pension_intro / investment_report / tender / ai_word / ai_ppt",
+        description="模板 ID，如 pension_intro / investment_report / tender / ai_word",
     )
 
 
@@ -46,8 +45,6 @@ _TEMPLATE_DOC_TYPE: dict[str, str] = {
     "investment_report": "investment_report_word",
     "word": "ai_word",
     "ai_word": "ai_word",
-    "ppt": "ai_ppt",
-    "ai_ppt": "ai_ppt",
 }
 
 
@@ -56,7 +53,6 @@ _DOC_TYPE_TEMPLATE: dict[str, str] = {
     "pension_intro_word": "pension_intro",
     "investment_report_word": "investment_report",
     "ai_word": "ai_word",
-    "ai_ppt": "ai_ppt",
 }
 
 
@@ -306,8 +302,6 @@ async def _ef_select_template(ictx: InstanceCtx) -> EffectOutput | None:
         return EffectOutput(message=f"未知模板: {template_id}")
     if doc_type == "ai_word":
         return await _ef_select_word(ictx)
-    if doc_type == "ai_ppt":
-        return await _ef_select_ppt(ictx)
     return await _create_project(ictx, doc_type)
 
 
@@ -363,41 +357,6 @@ async def _ef_select_word(ictx: InstanceCtx) -> EffectOutput | None:
             **state_delta,
             "docgen_state.mode": "ai",
             "docgen_state.doc_type": "ai_word",
-        },
-    )
-
-
-async def _ef_select_ppt(ictx: InstanceCtx) -> EffectOutput | None:
-    """选择 AI PPT 制作。"""
-    ictx.instance_data["mode"] = "ai"
-    ictx.instance_data["doc_type"] = "ai_ppt"
-    state_delta = _entry_state_delta(
-        ictx,
-        {
-            "mode": "ai",
-            "template_id": "ai_ppt",
-            "active_flow": None,
-            "stage": "ai_ppt_selected",
-            "awaiting": None,
-            "selection": {
-                "mode": "ai",
-                "template_id": "ai_ppt",
-                "format": "ppt",
-            },
-            "flows": {
-                "entry": {
-                    "stage": "template_selected",
-                    "awaiting": None,
-                },
-            },
-        },
-    )
-    return EffectOutput(
-        message="用户选择了 AI PPT 制作。请调用 consult_ppt_agent 委派 PPT 制作助手完成。",
-        extras={
-            **state_delta,
-            "docgen_state.mode": "ai",
-            "docgen_state.doc_type": "ai_ppt",
         },
     )
 
@@ -516,6 +475,4 @@ class DocgenEntryFlow(Workflow):
         # AI
         Transition("select_word", "idle", "routed", effect=_ef_select_word),
         Transition("select_word", ANY_STATE, "routed", effect=_ef_select_word),
-        Transition("select_ppt", "idle", "routed", effect=_ef_select_ppt),
-        Transition("select_ppt", ANY_STATE, "routed", effect=_ef_select_ppt),
     )
