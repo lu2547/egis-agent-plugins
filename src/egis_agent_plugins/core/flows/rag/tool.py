@@ -483,7 +483,14 @@ class RagTool(AgentTool):
                 if action == "read":
                     self._set_quality_trace_attrs(span, result.state_delta)
                 if not result.success:
-                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, result.digest or "step failed"))
+                    if action == "rank":
+                        rejection = getattr(result, "rejection", None)
+                        error_body = str(getattr(rejection, "message", None) or result.digest or "")
+                        span.set_attribute("rag.rank.error_body", error_body)
+                        logger.error("[RagRetrieval][rank] %s", error_body)
+                    else:
+                        error_body = str(result.digest or "step failed")
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, error_body))
                 else:
                     _apply_state_delta(result.state_delta)
                 return result

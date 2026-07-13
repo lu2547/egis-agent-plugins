@@ -70,8 +70,6 @@ class Rerank:
             results = await rerank.rerank(query, passages, top_k=10)
     """
 
-    _DEFAULT_TIMEOUT = 30.0
-
     def __init__(self, config: RAGConfig) -> None:
         self._config = config
 
@@ -90,6 +88,11 @@ class Rerank:
             and cfg.rerank_model
             and cfg.rerank_api_key
         )
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Rank 阶段和底层 HTTP 共用的唯一超时配置。"""
+        return self._config.rerank_timeout_s
 
     async def rerank(
         self,
@@ -175,9 +178,9 @@ class Rerank:
                 app_secret=cfg.pa_jt_gpt_app_secret,
                 scene_id=cfg.pa_jt_scene_id,
             )
-            return httpx.AsyncClient(transport=transport, timeout=self._DEFAULT_TIMEOUT)
+            return httpx.AsyncClient(transport=transport, timeout=self.timeout_seconds)
 
-        return httpx.AsyncClient(timeout=self._DEFAULT_TIMEOUT)
+        return httpx.AsyncClient(timeout=self.timeout_seconds)
 
     def _build_headers(self) -> dict[str, str]:
         """按 provider 构造请求头（PA-JT 鉴权由 Transport 注入，此处不加 Auth）。"""
@@ -211,14 +214,26 @@ class Rerank:
                     headers=headers,
                 )
         except httpx.TimeoutException as e:
+            logger.error(
+                "[Rerank] HTTP request timed out after %.3fs: %s",
+                self.timeout_seconds,
+                e,
+                exc_info=True,
+            )
             raise RerankError(f"Rerank API timeout: {e}") from e
         except httpx.HTTPError as e:
+            logger.error("[Rerank] HTTP request failed: %s", e, exc_info=True)
             raise RerankError(f"Rerank API network error: {e}") from e
 
         if resp.status_code != 200:
-            snippet = resp.text[:500] if resp.text else ""
+            response_body = resp.text if resp.text else ""
+            logger.error(
+                "[Rerank] HTTP %d response body: %s",
+                resp.status_code,
+                response_body,
+            )
             raise RerankError(
-                f"Rerank API HTTP {resp.status_code}: {snippet}"
+                f"Rerank API HTTP {resp.status_code}: {response_body}"
             )
 
         try:

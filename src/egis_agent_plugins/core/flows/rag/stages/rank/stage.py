@@ -10,6 +10,7 @@ from typing import Any
 
 from egis_agent_plugins.core.flows.rag.clients import RAGClients
 from egis_agent_plugins.core.flows.rag.stages.rank.mmr import apply_mmr
+from egis_agent_plugins.core.flows.rag.stages.rank.reranker import RerankError
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,16 @@ async def _rerank(clients: RAGClients, query: str, candidates: list[dict[str, An
         return []
     if not clients.rerank or not clients.rerank.enabled:
         return [float(item.get("recall_score", item.get("score", 0.0)) or 0.0) for item in candidates]
-    timeout = float(os.getenv("RAG_RERANK_TIMEOUT_S", "8"))
-    results = await asyncio.wait_for(
-        clients.rerank.rerank(query, [str(item.get("content") or "") for item in candidates]),
-        timeout=timeout,
-    )
+    timeout = clients.rerank.timeout_seconds
+    try:
+        results = await asyncio.wait_for(
+            clients.rerank.rerank(query, [str(item.get("content") or "") for item in candidates]),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        message = f"Rerank timeout after {timeout:g}s"
+        logger.error("[Rerank] %s", message, exc_info=True)
+        raise RerankError(message) from exc
     scores = [0.0] * len(candidates)
     for item in results:
         if 0 <= item.index < len(scores):

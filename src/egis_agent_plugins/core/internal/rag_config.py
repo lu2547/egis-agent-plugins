@@ -18,7 +18,7 @@ Embedding/Rerank 通过 import 该 Transport 完成网关鉴权。
 
     # Rerank（RAG 专属，统一 RAG_ 前缀）
     RAG_RERANK_PROVIDER=openai|pa_jt
-    RAG_RERANK_MODEL / RAG_RERANK_API_KEY / RAG_RERANK_BASE_URL / RAG_RERANK_TOP_K / RAG_RERANK_THRESHOLD
+    RAG_RERANK_MODEL / RAG_RERANK_API_KEY / RAG_RERANK_BASE_URL / RAG_RERANK_TOP_K / RAG_RERANK_THRESHOLD / RAG_RERANK_TIMEOUT_S
 
     # PA-JT 网关鉴权（provider=pa_jt 时生效，与 LLM 内核共用，不加 RAG_ 前缀）
     PA_JT_OPEN_API_CODE / PA_JT_OPEN_API_CREDENTIAL / PA_JT_RSA_PRIVATE_KEY
@@ -78,6 +78,7 @@ class RAGConfig:
     rerank_base_url: str = ""
     rerank_top_k: int = 10
     rerank_threshold: float = 0.8
+    rerank_timeout_s: float = 8.0
 
     # ── PA-JT 网关鉴权（Embedding/Rerank 共用）──
     pa_jt_open_api_code: str = ""
@@ -166,6 +167,7 @@ def get_rag_config() -> RAGConfig:
         rerank_base_url=os.getenv("RAG_RERANK_BASE_URL", ""),
         rerank_top_k=int(os.getenv("RAG_RERANK_TOP_K", "10")),
         rerank_threshold=float(os.getenv("RAG_RERANK_THRESHOLD", "0.7")),
+        rerank_timeout_s=float(os.getenv("RAG_RERANK_TIMEOUT_S", "8")),
 
         # PA-JT 网关鉴权
         pa_jt_open_api_code=os.getenv("PA_JT_OPEN_API_CODE", ""),

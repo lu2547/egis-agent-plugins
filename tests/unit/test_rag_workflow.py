@@ -410,6 +410,7 @@ class TestQualityEvaluation:
 
         class FakeRerank:
             enabled = True
+            timeout_seconds = 8.0
 
             def __init__(self) -> None:
                 self.calls: list[str] = []
