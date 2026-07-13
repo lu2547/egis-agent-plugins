@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any
@@ -90,17 +91,6 @@ class RagTool(AgentTool):
             ),
             required=False,
         ),
-        ToolParameter(
-            name="enable_evaluation",
-            type="boolean",
-            description=(
-                "是否启用 RAG 内部质量评估与补搜，默认 true。"
-                "设为 false 时跳过评估与补搜，首轮检索后直接结束；"
-                "适合由外部 Research Harness 负责覆盖评估的原子事实查询。"
-            ),
-            required=False,
-            default=True,
-        ),
     ]
 
     # data_source: RAG 工具产出 evidence，计入 citation 统计
@@ -147,6 +137,11 @@ class RagTool(AgentTool):
             if normalized in {"false", "0", "no", "off"}:
                 return False
         return default
+
+    @classmethod
+    def _evaluation_enabled_from_env(cls) -> bool:
+        """RAG 内部评估是部署配置，不允许由模型通过工具参数控制。"""
+        return cls._parse_bool(os.getenv("RAG_ENABLE_EVALUATION"), default=False)
 
     @staticmethod
     def _read_frontend_rag_filter(ctx: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -417,7 +412,7 @@ class RagTool(AgentTool):
         query = args.get("query", "")
         source = args.get("source", "auto")
         filters = self._inject_frontend_filters(args=args, ctx=ctx)
-        enable_evaluation = self._parse_bool(args.get("enable_evaluation"), default=True)
+        enable_evaluation = self._evaluation_enabled_from_env()
         max_retries = DEFAULT_QUALITY_MAX_RETRIES if enable_evaluation else 0
 
         if not query.strip():

@@ -913,3 +913,16 @@ class TestUserSelectedShortcut:
 
         assert filters["rag_filter"][0]["kb_id"] == "kb1"
         assert "hints" not in args
+
+
+class TestEvaluationConfig:
+    def test_evaluation_is_deployment_config_not_tool_parameter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from egis_agent_plugins.core.flows.rag.tool import RagTool
+
+        assert "enable_evaluation" not in {parameter.name for parameter in RagTool.parameters}
+
+        monkeypatch.delenv("RAG_ENABLE_EVALUATION", raising=False)
+        assert RagTool._evaluation_enabled_from_env() is False
+
+        monkeypatch.setenv("RAG_ENABLE_EVALUATION", "true")
+        assert RagTool._evaluation_enabled_from_env() is True
