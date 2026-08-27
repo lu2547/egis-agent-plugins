@@ -104,6 +104,10 @@ class RAGConfig:
     evidence_min_score: float = 0.3
     evidence_rewrite_max_loops: int = 1
 
+    # ── 检索后端 ──
+    # legacy = pymilvus 直连实现；llama_index = MilvusVectorStore 实现（接口对齐，可灰度）
+    rag_backend: Literal["legacy", "llama_index"] = "legacy"
+
     @property
     def db_dsn(self) -> str:
         """PostgreSQL 连接字符串"""
@@ -192,4 +196,7 @@ def get_rag_config() -> RAGConfig:
         rewrite_max_sub_queries=int(os.getenv("RAG_REWRITE_MAX_SUB_QUERIES", "4")),
         evidence_min_score=float(os.getenv("RAG_EVIDENCE_MIN_SCORE", "0.3")),
         evidence_rewrite_max_loops=int(os.getenv("RAG_EVIDENCE_REWRITE_MAX_LOOPS", "1")),
+
+        # 检索后端开关
+        rag_backend=os.getenv("RAG_BACKEND", "legacy"),  # type: ignore[arg-type]
     )

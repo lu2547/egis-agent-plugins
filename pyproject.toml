@@ -2,7 +2,7 @@
 name = "egis-agent-plugins"
 version = "0.1.0"
 description = "egis-agents plugins library — 对 ark-agentic 0.7.6 的封装与扩展（启动/路由/RAG/PPT/skill）"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "ark-agentic[server]>=0.7.6",
     "fastapi>=0.128.0",
@@ -20,6 +20,8 @@ dependencies = [
     "markdownify>=1.2.2",
     "Pillow>=10.0",
     "flask>=3.0.0",
+    "llama-index-core>=0.14.23",
+    "llama-index-vector-stores-milvus>=1.1.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +35,10 @@ dev = [
 # 生产部署：uv build 打包 whl，pip install 从 PyPI / 私有 registry 安装
 [tool.uv.sources]
 ark-agentic = { path = "../ark-agentic", editable = true }  # editable 绕过 ark 的 force-include 构建 bug
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [build-system]
 requires = ["hatchling"]

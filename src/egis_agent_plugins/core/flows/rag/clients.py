@@ -59,12 +59,13 @@ class RAGClients:
 # ─────────────────────────────────────────────────────
 
 def _config_signature(config: "RAGConfig") -> str:
-    """按 RAGConfig 生成唯一签名，仅含影响连接目标的字段。"""
+    """按 RAGConfig 生成唯一签名，仅含影响连接目标/后端实现的字段。"""
     return (
         f"milvus:{config.milvus_host}:{config.milvus_port}:{config.milvus_collection}"
         f"|pg:{config.db_host}:{config.db_port}:{config.db_user}:{config.db_name}"
         f"|emb:{config.embedding_provider}:{config.embedding_model}:{config.embedding_dimension}"
         f":{config.embedding_base_url}"
+        f"|backend:{config.rag_backend}"
     )
 
 
@@ -83,12 +84,22 @@ class ServiceRegistry:
 
     @classmethod
     def get_milvus(cls, config: "RAGConfig") -> "MilvusClient":
-        from egis_agent_plugins.core.service.base import MilvusClient
-
         sig = _config_signature(config)
         if sig not in cls._milvus_instances:
-            logger.info("[ServiceRegistry] Creating new MilvusClient (sig=%s...)", sig[:60])
-            cls._milvus_instances[sig] = MilvusClient(config=config)
+            if config.rag_backend == "llama_index":
+                from egis_agent_plugins.core.service.base.llama_index_clients import (
+                    LlamaIndexMilvusClient,
+                )
+
+                logger.info(
+                    "[ServiceRegistry] Creating LlamaIndexMilvusClient (sig=%s...)", sig[:60]
+                )
+                cls._milvus_instances[sig] = LlamaIndexMilvusClient(config=config)
+            else:
+                from egis_agent_plugins.core.service.base import MilvusClient
+
+                logger.info("[ServiceRegistry] Creating new MilvusClient (sig=%s...)", sig[:60])
+                cls._milvus_instances[sig] = MilvusClient(config=config)
         return cls._milvus_instances[sig]
 
     @classmethod
